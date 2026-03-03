@@ -22,7 +22,7 @@ rustls-pemfile = "2"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 webpki-roots = "1"
 flate2 = "1"
-brotli = "7"
+brotli = "8"
 directories = "6"
 time = "0.3"
 log = "0.4"
