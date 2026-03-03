@@ -30,7 +30,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI5RkZEMUU0RTFFMTZCQzAKUldUQWErSGg1TkgvS2R1V1pveXdDZ0locVBtOWJPYlJYL1I4WGF1dGRpbytrM2lENmlqODdqN3AK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENGRjhCMkQ1RDk2MjI1OTEKUldTUkpXTFoxYkw0ejdrbHJDRGJoQkM4eHdQRDdFTjBnWkQ1cjJWK2E1eG5sY2dMeVg3c1M3clAK",
       "endpoints": [
         "https://github.com/WarFiN123/packetsniffer/releases/latest/download/latest.json"
       ],
@@ -39,6 +39,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["msi", "app", "dmg", "deb", "appimage"],
     "icon": [
       "icons/32x32.png",
