@@ -33,3 +33,7 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 bun-error.log*
+
+# Tauri Updater Keys
+updater.key
+updater.key.pub
