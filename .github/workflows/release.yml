@@ -1,9 +1,9 @@
-name: 'Release'
+name: "Release"
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   publish-tauri:
@@ -13,18 +13,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: 'macos-latest'
-            args: '--target aarch64-apple-darwin'
-          - platform: 'macos-latest'
-            args: '--target x86_64-apple-darwin'
-          - platform: 'ubuntu-22.04'
-            args: ''
-          - platform: 'windows-latest'
-            args: ''
+          - platform: "macos-latest"
+            args: "--target aarch64-apple-darwin"
+          - platform: "macos-latest"
+            args: "--target x86_64-apple-darwin"
+          - platform: "ubuntu-22.04"
+            args: ""
+          - platform: "windows-latest"
+            args: ""
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -34,7 +34,7 @@ jobs:
       - name: rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: 'src-tauri -> target'
+          workspaces: "src-tauri -> target"
 
       - name: install dependencies (ubuntu only)
         if: matrix.platform == 'ubuntu-22.04'
@@ -43,7 +43,7 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: install bun
-        uses: oven-sh/setup-bun@v1
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
@@ -57,7 +57,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'PacketSniffer ${{ github.ref_name }}'
+          releaseName: "PacketSniffer ${{ github.ref_name }}"
           releaseBody: |
             > [!CAUTION]
             > This is a very early stage of the application. Things are subject to change and expect bugs. NOT tested outside of Windows

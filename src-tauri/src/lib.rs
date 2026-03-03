@@ -41,10 +41,7 @@ async fn get_proxy_status(state: tauri::State<'_, ProxyState>) -> Result<String,
 }
 
 #[tauri::command]
-async fn start_proxy(
-    app: AppHandle,
-    state: tauri::State<'_, ProxyState>,
-) -> Result<u16, String> {
+async fn start_proxy(app: AppHandle, state: tauri::State<'_, ProxyState>) -> Result<u16, String> {
     let mut engine_guard = state.engine.lock().await;
     if engine_guard.is_some() {
         return Err("Proxy is already running".to_string());
@@ -137,26 +134,34 @@ async fn set_proxy_port(
 
 #[tauri::command]
 async fn install_ca_certificate() -> Result<String, String> {
-    cert_store::ensure_ca_trusted().await.map_err(|e| e.to_string())
+    cert_store::ensure_ca_trusted()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn open_in_postman(json: String) -> Result<(), String> {
     let mut path = std::env::temp_dir();
-    path.push(format!("postman_req_{}.json", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()));
+    path.push(format!(
+        "postman_req_{}.json",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    
+
     // Convert path to absolute string, making sure it's valid for URI
     let path_str = path.to_string_lossy().replace('\\', "/");
     let uri = format!("postman://app/collections/import?path={}", path_str);
-    
+
     // Attempt to open the custom URL scheme
     if let Err(_e) = open::that(&uri) {
         // Fallback: try opening the file directly, the OS might map .json to code editor,
         // but Postman might be the handler if we named it .postman_collection.json.
         // Actually, let's rename it to have that extension just in case.
     }
-    
+
     Ok(())
 }
 
@@ -164,8 +169,7 @@ async fn open_in_postman(json: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Install the ring crypto provider for rustls 0.23+
     rustls::crypto::ring::default_provider()
@@ -189,7 +193,6 @@ pub fn run() {
     }));
 
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -249,7 +252,10 @@ pub fn run() {
                                 log::info!("CA trust store: {}", msg);
                             }
                             Err(e) => {
-                                log::warn!("CA cert not trusted — HTTPS interception will fail: {}", e);
+                                log::warn!(
+                                    "CA cert not trusted — HTTPS interception will fail: {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -271,28 +277,34 @@ pub fn run() {
                     if let Some(engine) = &*engine_guard {
                         let expected_port = engine.port();
                         let is_overridden = system_proxy::is_overridden(expected_port);
-                        
+
                         if is_overridden != was_overridden {
                             was_overridden = is_overridden;
-                            
+
                             #[derive(Serialize, Clone)]
                             struct ProxyOverrideEvent {
                                 overridden: bool,
                             }
-                            
-                            let _ = monitor_handle.emit("proxy_overridden", ProxyOverrideEvent { overridden: is_overridden });
+
+                            let _ = monitor_handle.emit(
+                                "proxy_overridden",
+                                ProxyOverrideEvent {
+                                    overridden: is_overridden,
+                                },
+                            );
                         }
                     } else {
                         // If proxy is stopped, it shouldn't show as overridden.
                         if was_overridden {
                             was_overridden = false;
-                            
+
                             #[derive(Serialize, Clone)]
                             struct ProxyOverrideEvent {
                                 overridden: bool,
                             }
-                            
-                            let _ = monitor_handle.emit("proxy_overridden", ProxyOverrideEvent { overridden: false });
+
+                            let _ = monitor_handle
+                                .emit("proxy_overridden", ProxyOverrideEvent { overridden: false });
                         }
                     }
                 }
@@ -346,10 +358,20 @@ fn cleanup_stale_proxy() {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
 
             let _ = std::process::Command::new("reg")
-                .args(["add", reg_path, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"])
+                .args([
+                    "add",
+                    reg_path,
+                    "/v",
+                    "ProxyEnable",
+                    "/t",
+                    "REG_DWORD",
+                    "/d",
+                    "0",
+                    "/f",
+                ])
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
-                
+
             // Also clean up the ProxyServer value so it doesn't get saved as the "original" state
             let _ = std::process::Command::new("reg")
                 .args(["delete", reg_path, "/v", "ProxyServer", "/f"])

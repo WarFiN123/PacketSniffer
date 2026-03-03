@@ -27,25 +27,6 @@ export function formatWsTime(epochMs: number): string {
   return `${h}:${m}:${s}.${ms}`;
 }
 
-export function methodColor(method: string): string {
-  switch (method.toUpperCase()) {
-    case "GET":
-      return "text-green bg-green/10";
-    case "POST":
-      return "text-link bg-link/10";
-    case "PUT":
-      return "text-yellow bg-yellow/10";
-    case "PATCH":
-      return "text-orange bg-orange/10";
-    case "DELETE":
-      return "text-red bg-red/10";
-    case "OPTIONS":
-    case "HEAD":
-      return "text-purple bg-purple/10";
-    default:
-      return "text-text-2 bg-bg-3";
-  }
-}
 export function shortType(contentType: string): string {
   if (!contentType) return "";
   const base = contentType.split(";")[0].trim();
@@ -69,11 +50,3 @@ export function shortType(contentType: string): string {
   return base.replace("application/", "");
 }
 
-export function statusClass(status: number): string {
-  if (status === 0) return "text-text-2";
-  if (status < 200) return "text-text-2"; // 1xx informational
-  if (status < 300) return "text-green"; // 2xx success
-  if (status < 400) return "text-link"; // 3xx redirect
-  if (status < 500) return "text-yellow"; // 4xx client error
-  return "text-red"; // 5xx server error
-}
