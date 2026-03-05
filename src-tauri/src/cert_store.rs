@@ -634,11 +634,89 @@ fn configure_firefox_enterprise_roots_linux(ca_cert_path: &str) {
     if let Ok(s) = status {
         if s.success() {
             log::info!("Wrote Firefox policies.json (with base64 cert) to multiple system directories");
+        } else {
+            log::warn!("pkexec failed to write policies.json. Exit status: {}", s);
         }
     }
 
-    // 2. Fallback: Write user.js into all local Firefox profiles
+    // 2. Add cert to all NSS databases (cert9.db) using certutil as a fallback
+    install_firefox_nss_linux(ca_cert_path);
+
+    // 3. Fallback: Write user.js into all local Firefox profiles
     configure_firefox_profiles_fallback_linux();
+}
+
+/// Fallback for Linux: attempts to install the CA certificate directly into Firefox's
+/// NSS database using `certutil` (from libnss3-tools).
+#[cfg(target_os = "linux")]
+fn install_firefox_nss_linux(ca_cert_path: &str) {
+    use std::process::Command;
+
+    // Check if certutil is installed
+    if Command::new("certutil").arg("-H").output().is_err() {
+        log::warn!("certutil not found. Please install libnss3-tools to automatically trust CA in Firefox via NSS.");
+        return;
+    }
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    let base_dirs = [
+        format!("{}/.mozilla/firefox", home),
+        format!("{}/snap/firefox/common/.mozilla/firefox", home),
+        format!("{}/.var/app/org.mozilla.firefox/.mozilla/firefox", home),
+    ];
+
+    for base in base_dirs {
+        let profiles_dir = std::path::Path::new(&base);
+        if !profiles_dir.exists() {
+            continue;
+        }
+
+        let entries = match std::fs::read_dir(profiles_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            // A profile directory must have a cert9.db
+            if !path.join("cert9.db").exists() {
+                continue;
+            }
+
+            log::info!("Installing CA directly to NSS database in profile: {}", path.display());
+            
+            // certutil -d sql:/path/to/profile -A -t "C,," -n "PacketSniffer CA" -i /path/to/cert
+            let status = Command::new("certutil")
+                .args([
+                    "-d",
+                    &format!("sql:{}", path.display()),
+                    "-A",
+                    "-t",
+                    "C,,",
+                    "-n",
+                    "PacketSniffer Root CA",
+                    "-i",
+                    ca_cert_path,
+                ])
+                .status();
+
+            if let Ok(s) = status {
+                if !s.success() {
+                    log::warn!("certutil failed for profile {}", path.display());
+                }
+            } else {
+                log::warn!("Failed to execute certutil for profile {}", path.display());
+            }
+        }
+    }
 }
 
 /// Fallback for Linux: sets security.enterprise_roots.enabled in user.js for each Firefox profile.

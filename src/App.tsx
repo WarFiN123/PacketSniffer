@@ -244,7 +244,7 @@ export default function App() {
     selectedId !== null ? (wsMessages.get(selectedId) ?? []) : [];
 
   return (
-    <main className="h-screen w-screen flex flex-col overflow-hidden bg-background">
+    <main className="h-screen w-screen flex flex-col overflow-hidden bg-transparent rounded-xl border border-border/20 shadow-2xl">
       <div className="h-full flex flex-col bg-bg-0">
         <Toolbar
           connected={connected}
