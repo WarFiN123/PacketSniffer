@@ -121,15 +121,20 @@ fn enable_windows(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sy
     let mut state = ORIGINAL_STATE.lock().unwrap();
     // Only save the original state if we haven't already saved it
     if state.is_none() {
-        // Query WinHTTP state before we change it
-        let (winhttp_was_set, winhttp_proxy, winhttp_bypass) = winhttp_query();
-        *state = Some(OriginalProxyState {
-            proxy_enable: current_enable,
-            proxy_server: current_server,
-            winhttp_was_set,
-            winhttp_proxy,
-            winhttp_bypass,
-        });
+        if !(current_enable == 1
+            && (current_server.starts_with("127.0.0.1:")
+                || current_server.starts_with("localhost:")))
+        {
+            // Query WinHTTP state before we change it
+            let (winhttp_was_set, winhttp_proxy, winhttp_bypass) = winhttp_query();
+            *state = Some(OriginalProxyState {
+                proxy_enable: current_enable,
+                proxy_server: current_server,
+                winhttp_was_set,
+                winhttp_proxy,
+                winhttp_bypass,
+            });
+        }
     }
 
     // Set proxy via reg.exe
@@ -551,15 +556,19 @@ fn enable_macos(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync
 
     let mut state = ORIGINAL_STATE.lock().unwrap();
     if state.is_none() {
-        *state = Some(OriginalProxyState {
-            services: services.clone(),
-            http_enabled,
-            http_server,
-            http_port,
-            https_enabled,
-            https_server,
-            https_port,
-        });
+        let is_us = (http_enabled && (http_server == "127.0.0.1" || http_server == "localhost"))
+            || (https_enabled && (https_server == "127.0.0.1" || https_server == "localhost"));
+        if !is_us {
+            *state = Some(OriginalProxyState {
+                services: services.clone(),
+                http_enabled,
+                http_server,
+                http_port,
+                https_enabled,
+                https_server,
+                https_port,
+            });
+        }
     }
 
     let port_str = port.to_string();
@@ -630,12 +639,12 @@ fn disable_macos() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         None => {
             // Force disable just in case
-            for service in &["Wi-Fi", "Ethernet"] {
+            for service in get_active_network_services() {
                 let _ = Command::new("networksetup")
-                    .args(["-setwebproxystate", service, "off"])
+                    .args(["-setwebproxystate", &service, "off"])
                     .status();
                 let _ = Command::new("networksetup")
-                    .args(["-setsecurewebproxystate", service, "off"])
+                    .args(["-setsecurewebproxystate", &service, "off"])
                     .status();
             }
         }
@@ -702,13 +711,16 @@ fn enable_linux(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync
 
     let mut state = ORIGINAL_STATE.lock().unwrap();
     if state.is_none() {
-        *state = Some(OriginalProxyState {
-            mode,
-            http_host,
-            http_port,
-            https_host,
-            https_port,
-        });
+        let is_us = mode == "manual" && (http_host == "127.0.0.1" || http_host == "localhost");
+        if !is_us {
+            *state = Some(OriginalProxyState {
+                mode,
+                http_host,
+                http_port,
+                https_host,
+                https_port,
+            });
+        }
     }
 
     let port_str = port.to_string();

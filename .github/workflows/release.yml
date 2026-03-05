@@ -1,12 +1,80 @@
 name: "Release"
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag_name: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump versions, commit, and tag
+        id: bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 1. Bump package.json (this also updates the version without tagging)
+          npm version ${{ github.event.inputs.bump }} --no-git-tag-version
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          
+          # 2. Bump tauri.conf.json
+          tmp=$(mktemp)
+          jq ".version = \"$NEW_VERSION\"" src-tauri/tauri.conf.json > "$tmp"
+          mv "$tmp" src-tauri/tauri.conf.json
+          
+          # 3. Bump Cargo.toml
+          sed -i "0,/^version = \".*\"/s/^version = \".*\"/version = \"$NEW_VERSION\"/" src-tauri/Cargo.toml
+          
+          # 4. Update lockfiles
+          bun install
+          cd src-tauri && cargo check && cd ..
+          
+          # 5. Commit and tag
+          git add package.json bun.lock src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+          git commit -m "chore: release v$NEW_VERSION"
+          git tag "v$NEW_VERSION"
+          
+          # 6. Push commit and tag
+          git push origin HEAD
+          git push origin "v$NEW_VERSION"
+          
+          # Export the tag for the next job
+          echo "version=v$NEW_VERSION" >> $GITHUB_OUTPUT
+
   publish-tauri:
+    needs: prepare-release
     permissions:
       contents: write
     strategy:
@@ -25,6 +93,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag_name }}
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -56,37 +126,35 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "PacketSniffer ${{ github.ref_name }}"
+          tagName: ${{ needs.prepare-release.outputs.tag_name }}
+          releaseName: "PacketSniffer ${{ needs.prepare-release.outputs.tag_name }}"
           releaseBody: |
             > [!CAUTION]
             > This is a very early stage of the application. Things are subject to change and expect bugs. NOT tested outside of Windows
 
-            **Full Changelog**: https://github.com/WarFiN123/PacketSniffer/commits/${{ github.ref_name }}
+            **Full Changelog**: https://github.com/WarFiN123/PacketSniffer/commits/${{ needs.prepare-release.outputs.tag_name }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 
-      # Remove the .pub file from the release
-      - name: Remove .pub files from release
+      # Remove signature files from the release
+      - name: Remove signature files from release
         if: success()
         uses: actions/github-script@v7
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const tag = context.payload.ref.replace('refs/tags/', '');
+            const tag = '${{ needs.prepare-release.outputs.tag_name }}';
             
-            // Get release by tag
             const release = await github.rest.repos.getReleaseByTag({
               owner,
               repo,
               tag
             });
             
-            // Find and delete any .pub assets
             for (const asset of release.data.assets) {
-              if (asset.name.endsWith('.pub')) {
+              if (asset.name.endsWith('.pub') || asset.name.endsWith('.sig')) {
                 console.log(`Deleting ${asset.name}...`);
                 await github.rest.repos.deleteReleaseAsset({
                   owner,
