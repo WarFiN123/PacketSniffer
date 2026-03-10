@@ -140,7 +140,7 @@ jobs:
       # Remove signature files from the release
       - name: Remove signature files from release
         if: success()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const owner = context.repo.owner;
