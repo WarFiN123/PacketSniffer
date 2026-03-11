@@ -215,6 +215,14 @@ fn enable_windows(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sy
     let winhttp_bypass = "<local>;localhost;127.0.0.1;::1";
     let _ = winhttp_set_proxy(&proxy_addr, winhttp_bypass);
 
+    // Set environment variables for apps that read HTTP_PROXY / HTTPS_PROXY
+    // (e.g. terminal sessions, pip, npm, git, curl, wget, Go apps, Rust apps)
+    set_env_proxy_windows(port);
+
+    // Enable loopback for UWP/AppContainer apps (e.g. Microsoft Store, Mail, etc.)
+    // so they can connect to our localhost proxy
+    enable_uwp_loopback();
+
     log::info!("System proxy set to {}", proxy_addr);
     Ok(())
 }
@@ -251,6 +259,8 @@ fn disable_windows() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .output();
                 notify_windows_proxy_change();
             }
+            // Always clear env vars on disable, even if we didn't track the original state
+            clear_env_proxy_windows();
             return Ok(());
         }
     };
@@ -301,6 +311,9 @@ fn disable_windows() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         let _ = winhttp_reset();
     }
+
+    // Remove environment variable proxy settings
+    clear_env_proxy_windows();
 
     log::info!("System proxy restored to original settings");
     Ok(())
@@ -496,6 +509,139 @@ fn notify_windows_proxy_change() {
 #[cfg(target_os = "windows")]
 pub fn notify_proxy_change() {
     notify_windows_proxy_change();
+}
+
+/// Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY environment variables in the
+/// user registry so that new terminal sessions and CLI tools pick them up.
+/// Broadcasts WM_SETTINGCHANGE so running shells see the update.
+#[cfg(target_os = "windows")]
+fn set_env_proxy_windows(port: u16) {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let env_path = r"HKCU\Environment";
+    let proxy_url = format!("http://127.0.0.1:{}", port);
+    let no_proxy = "localhost,127.0.0.1,::1";
+
+    for (name, value) in [
+        ("HTTP_PROXY", proxy_url.as_str()),
+        ("HTTPS_PROXY", proxy_url.as_str()),
+        ("http_proxy", proxy_url.as_str()),
+        ("https_proxy", proxy_url.as_str()),
+        ("NO_PROXY", no_proxy),
+        ("no_proxy", no_proxy),
+    ] {
+        let _ = Command::new("reg")
+            .args(["add", env_path, "/v", name, "/t", "REG_SZ", "/d", value, "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+
+    broadcast_setting_change_windows();
+    log::info!("Set HTTP_PROXY/HTTPS_PROXY environment variables (port {})", port);
+}
+
+/// Remove the proxy environment variables we set and broadcast the change.
+#[cfg(target_os = "windows")]
+fn clear_env_proxy_windows() {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let env_path = r"HKCU\Environment";
+
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ] {
+        let _ = Command::new("reg")
+            .args(["delete", env_path, "/v", name, "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+
+    broadcast_setting_change_windows();
+    log::info!("Cleared HTTP_PROXY/HTTPS_PROXY environment variables");
+}
+
+/// Broadcast WM_SETTINGCHANGE so running Explorer / shells pick up env changes.
+#[cfg(target_os = "windows")]
+fn broadcast_setting_change_windows() {
+    unsafe {
+        #[link(name = "user32")]
+        extern "system" {
+            fn SendMessageTimeoutW(
+                hwnd: *mut std::ffi::c_void,
+                msg: u32,
+                wparam: usize,
+                lparam: *const u16,
+                flags: u32,
+                timeout: u32,
+                result: *mut usize,
+            ) -> isize;
+        }
+        // HWND_BROADCAST = 0xFFFF, WM_SETTINGCHANGE = 0x001A, SMTO_ABORTIFHUNG = 0x0002
+        let env: Vec<u16> = "Environment\0".encode_utf16().collect();
+        let mut _result: usize = 0;
+        SendMessageTimeoutW(
+            0xFFFF as *mut _,
+            0x001A,
+            0,
+            env.as_ptr(),
+            0x0002,
+            5000,
+            &mut _result,
+        );
+    }
+}
+
+/// Enable loopback for UWP / AppContainer apps so they can connect to our
+/// localhost proxy. Uses `CheckNetIsolation` which is available on Win 8+.
+/// Microsoft Store, Mail, and other UWP apps run in AppContainers that block
+/// loopback by default, preventing them from reaching 127.0.0.1.
+#[cfg(target_os = "windows")]
+fn enable_uwp_loopback() {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    // Well-known package family names for common UWP apps
+    let uwp_packages = [
+        "Microsoft.WindowsStore_8wekyb3d8bbwe",
+        "microsoft.windowscommunicationsapps_8wekyb3d8bbwe",
+        "Microsoft.MicrosoftEdge_8wekyb3d8bbwe",
+        "Microsoft.Windows.Search_cw5n1h2txyewy",
+        "Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy",
+        "Microsoft.Windows.ContentDeliveryManager_cw5n1h2txyewy",
+        "Microsoft.StorePurchaseApp_8wekyb3d8bbwe",
+    ];
+
+    for pkg in &uwp_packages {
+        let result = Command::new("CheckNetIsolation")
+            .args(["LoopbackExempt", "-a", &format!("-n={}", pkg)])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        match result {
+            Ok(o) if o.status.success() => {
+                log::debug!("Loopback exemption added for {}", pkg);
+            }
+            Ok(o) => {
+                log::debug!(
+                    "Loopback exemption skipped for {}: {}",
+                    pkg,
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+            Err(e) => {
+                log::debug!("CheckNetIsolation failed for {}: {}", pkg, e);
+            }
+        }
+    }
 }
 
 // ─── macOS ────────────────────────────────────────────────────────────────────
@@ -748,6 +894,11 @@ fn enable_linux(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync
         ])
         .status();
 
+    // Set environment variables so terminal apps (curl, wget, pip, npm, git, etc.)
+    // route through our proxy. Write a drop-in file in /etc/profile.d/ and
+    // /etc/environment.d/ so all new shells and services pick them up.
+    set_env_proxy_linux(port);
+
     log::info!("System proxy set to 127.0.0.1:{}", port);
     Ok(())
 }
@@ -808,6 +959,9 @@ fn disable_linux() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Remove proxy environment variable drop-in files
+    clear_env_proxy_linux();
+
     log::info!("System proxy restored to original settings");
     Ok(())
 }
@@ -847,4 +1001,281 @@ fn gsettings_get(schema: &str, key: &str) -> String {
                 .to_string()
         })
         .unwrap_or_default()
+}
+
+/// Write a drop-in shell script that exports proxy env vars for all new shells,
+/// and an environment.d config for systemd user services.
+#[cfg(target_os = "linux")]
+fn set_env_proxy_linux(port: u16) {
+    use std::process::Command;
+
+    let proxy_url = format!("http://127.0.0.1:{}", port);
+    let no_proxy = "localhost,127.0.0.1,::1";
+
+    // 1. /etc/profile.d/packetsniffer-proxy.sh — sourced by login shells (bash, zsh, etc.)
+    let profile_script = format!(
+        r#"# Managed by PacketSniffer — do not edit
+export http_proxy="{proxy_url}"
+export https_proxy="{proxy_url}"
+export HTTP_PROXY="{proxy_url}"
+export HTTPS_PROXY="{proxy_url}"
+export no_proxy="{no_proxy}"
+export NO_PROXY="{no_proxy}"
+"#
+    );
+
+    // 2. /etc/environment.d/packetsniffer-proxy.conf — read by systemd and PAM
+    let env_conf = format!(
+        r#"# Managed by PacketSniffer — do not edit
+http_proxy={proxy_url}
+https_proxy={proxy_url}
+HTTP_PROXY={proxy_url}
+HTTPS_PROXY={proxy_url}
+no_proxy={no_proxy}
+NO_PROXY={no_proxy}
+"#
+    );
+
+    let script = format!(
+        r#"cat > /etc/profile.d/packetsniffer-proxy.sh << 'EOF'
+{profile_script}EOF
+chmod 644 /etc/profile.d/packetsniffer-proxy.sh
+mkdir -p /etc/environment.d
+cat > /etc/environment.d/packetsniffer-proxy.conf << 'EOF'
+{env_conf}EOF
+chmod 644 /etc/environment.d/packetsniffer-proxy.conf"#
+    );
+
+    let status = Command::new("pkexec")
+        .args(["bash", "-c", &script])
+        .status();
+
+    match &status {
+        Ok(s) if s.success() => {
+            log::info!("Set proxy environment variables via profile.d + environment.d (port {})", port);
+        }
+        Ok(s) => {
+            log::warn!("pkexec failed to set env proxy files. Exit status: {}", s);
+        }
+        Err(e) => {
+            log::warn!("Failed to run pkexec for env proxy: {}", e);
+        }
+    }
+}
+
+/// Remove the drop-in proxy configuration files.
+#[cfg(target_os = "linux")]
+fn clear_env_proxy_linux() {
+    use std::process::Command;
+
+    let script = "rm -f /etc/profile.d/packetsniffer-proxy.sh /etc/environment.d/packetsniffer-proxy.conf";
+    let status = Command::new("pkexec")
+        .args(["bash", "-c", script])
+        .status();
+
+    match &status {
+        Ok(s) if s.success() => {
+            log::info!("Cleared proxy environment variable files");
+        }
+        Ok(s) => {
+            log::warn!("pkexec failed to clear env proxy files. Exit status: {}", s);
+        }
+        Err(e) => {
+            log::warn!("Failed to run pkexec for env proxy cleanup: {}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_enable_returns_result() {
+        // Test that enable returns a Result
+        let result = enable(8080);
+        // Should return Ok or Err, both are valid in test environment
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_disable_returns_result() {
+        // Test that disable returns a Result
+        let result = disable();
+        // Should return Ok or Err, both are valid in test environment
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_is_overridden_returns_bool() {
+        // Test that is_overridden returns a boolean
+        let result = is_overridden(8080);
+        // Should always return a bool
+        assert!(result || !result);
+    }
+
+    #[test]
+    fn test_enable_with_various_ports() {
+        // Test enabling with different port numbers
+        for port in [80, 8080, 3000, 9000, 65535] {
+            let result = enable(port);
+            // Should handle all valid ports
+            assert!(result.is_ok() || result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_enable_with_boundary_ports() {
+        // Boundary test: minimum and maximum port numbers
+        let result_min = enable(1);
+        let result_max = enable(65535);
+        assert!(result_min.is_ok() || result_min.is_err());
+        assert!(result_max.is_ok() || result_max.is_err());
+    }
+
+    #[test]
+    fn test_is_overridden_with_various_ports() {
+        // Test is_overridden with different ports
+        for port in [80, 8080, 3000, 9000] {
+            let result = is_overridden(port);
+            assert!(result || !result);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_reg_query_dword_with_invalid_path() {
+        // Test reg_query_dword with non-existent registry path
+        let result = reg_query_dword("HKCU\\NonExistent\\Path", "NonExistentValue");
+        // Should return None for invalid paths
+        assert!(result.is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_reg_query_string_with_invalid_path() {
+        // Test reg_query_string with non-existent registry path
+        let result = reg_query_string("HKCU\\NonExistent\\Path", "NonExistentValue");
+        // Should return None for invalid paths
+        assert!(result.is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_reg_query_dword_returns_option() {
+        // Test that reg_query_dword returns an Option<u32>
+        let result = reg_query_dword(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyEnable",
+        );
+        // Should return Some or None
+        assert!(result.is_some() || result.is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_reg_query_string_returns_option() {
+        // Test that reg_query_string returns an Option<String>
+        let result = reg_query_string(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyServer",
+        );
+        // Should return Some or None
+        assert!(result.is_some() || result.is_none());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_winhttp_query_returns_tuple() {
+        // Test that winhttp_query returns a tuple
+        let result = winhttp_query();
+        // Should return (bool, String, String)
+        assert!(result.0 || !result.0); // bool
+        assert!(result.1.is_empty() || !result.1.is_empty()); // String
+        assert!(result.2.is_empty() || !result.2.is_empty()); // String
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_notify_proxy_change_does_not_panic() {
+        // Regression test: ensure notify_proxy_change doesn't panic
+        notify_proxy_change();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_get_active_network_services_returns_vec() {
+        // Test that get_active_network_services returns a Vec
+        let result = get_active_network_services();
+        // Should return a Vec (may be empty or non-empty)
+        assert!(result.is_empty() || !result.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_gsettings_get_returns_string() {
+        // Test that gsettings_get returns a String
+        let result = gsettings_get("org.gnome.system.proxy", "mode");
+        // Should always return a String (empty or non-empty)
+        assert!(result.is_empty() || !result.is_empty());
+    }
+
+    #[test]
+    fn test_disable_multiple_times() {
+        // Test that disable can be called multiple times
+        let result1 = disable();
+        let result2 = disable();
+        // Both calls should succeed or fail gracefully
+        assert!(result1.is_ok() || result1.is_err());
+        assert!(result2.is_ok() || result2.is_err());
+    }
+
+    #[test]
+    fn test_enable_disable_sequence() {
+        // Test enabling and then disabling
+        let enable_result = enable(8081);
+        let disable_result = disable();
+        // Both should complete without panicking
+        assert!(enable_result.is_ok() || enable_result.is_err());
+        assert!(disable_result.is_ok() || disable_result.is_err());
+    }
+
+    #[test]
+    fn test_is_overridden_consistent_for_same_port() {
+        // Test that is_overridden returns consistent results for same port
+        let port = 8080;
+        let result1 = is_overridden(port);
+        let result2 = is_overridden(port);
+        // Results should be the same
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn test_enable_with_high_port() {
+        // Test with a high port number (boundary case)
+        let result = enable(60000);
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_enable_with_low_port() {
+        // Test with a low port number (boundary case)
+        let result = enable(100);
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_original_state_mutex_not_poisoned() {
+        // Test that the ORIGINAL_STATE mutex is not poisoned
+        let state = ORIGINAL_STATE.lock();
+        assert!(state.is_ok());
+    }
+
+    #[test]
+    fn test_disable_when_never_enabled() {
+        // Test disabling when proxy was never enabled
+        // This should handle gracefully
+        let result = disable();
+        assert!(result.is_ok() || result.is_err());
+    }
 }

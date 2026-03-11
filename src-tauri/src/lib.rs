@@ -172,6 +172,16 @@ async fn check_ca_trusted() -> Result<bool, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn check_missing_deps() -> Vec<String> {
+    cert_store::check_missing_dependencies()
+}
+
+#[tauri::command]
+async fn install_dependency(package: String) -> Result<String, String> {
+    cert_store::install_package(&package).map_err(|e| e.to_string())
+}
+
 // ─── App Entry ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -215,6 +225,8 @@ pub fn run() {
             set_proxy_port,
             install_ca_certificate,
             check_ca_trusted,
+            check_missing_deps,
+            install_dependency,
             open_in_postman,
         ])
         .setup(|app| {
@@ -224,6 +236,20 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<ProxyState>();
                 let mut engine_guard = state.engine.lock().await;
+
+                // Ensure CA is trusted BEFORE starting the proxy so browsers
+                // never see an untrusted cert during the startup window.
+                match cert_store::ensure_ca_trusted().await {
+                    Ok(msg) => {
+                        log::info!("CA trust store: {}", msg);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "CA cert not trusted — HTTPS interception may fail: {}",
+                            e
+                        );
+                    }
+                }
 
                 let app_handle = handle.clone();
                 let app_handle_ws = handle.clone();
@@ -252,18 +278,6 @@ pub fn run() {
                             }
                             Err(e) => {
                                 log::error!("Failed to set system proxy: {}", e);
-                            }
-                        }
-
-                        match cert_store::ensure_ca_trusted().await {
-                            Ok(msg) => {
-                                log::info!("CA trust store: {}", msg);
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "CA cert not trusted — HTTPS interception will fail: {}",
-                                    e
-                                );
                             }
                         }
                     }
@@ -389,6 +403,17 @@ fn cleanup_stale_proxy() {
             system_proxy::notify_proxy_change();
             log::info!("Cleaned up stale proxy from previous session");
         }
+
+        // Also clean up stale environment variable proxy settings from a previous crash
+        let env_path = r"HKCU\Environment";
+        if system_proxy::reg_query_string(env_path, "HTTP_PROXY")
+            .map(|v| v.starts_with("http://127.0.0.1:"))
+            .unwrap_or(false)
+        {
+            log::warn!("Detected stale proxy environment variables — clearing");
+            // Delegate to disable which clears env vars
+            let _ = system_proxy::disable();
+        }
     }
 }
 
@@ -415,5 +440,293 @@ fn install_ctrl_handler() {
             SetConsoleCtrlHandler(Some(handler), 1);
         }
         log::debug!("Console ctrl handler installed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_event_serialization() {
+        // Test that SessionEvent can be serialized
+        use crate::proxy::http::HttpSession;
+
+        let session = HttpSession {
+            id: 1,
+            method: "GET".to_string(),
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            path: "/test".to_string(),
+            url: "https://example.com/test".to_string(),
+            status: 200,
+            statusText: "OK".to_string(),
+            contentType: Some("application/json".to_string()),
+            requestHeaders: vec![],
+            responseHeaders: vec![],
+            requestBody: None,
+            responseBody: None,
+            responseSize: Some(100),
+            duration: Some(50),
+            complete: true,
+        };
+
+        let event = SessionEvent {
+            event_type: "start".to_string(),
+            session,
+        };
+
+        let json = serde_json::to_string(&event);
+        assert!(json.is_ok());
+    }
+
+    #[test]
+    fn test_ws_message_event_serialization() {
+        // Test that WsMessageEvent can be serialized
+        use crate::proxy::ws::WsMessage;
+
+        let message = WsMessage {
+            sessionId: 1,
+            timestamp: 12345,
+            direction: "sent".to_string(),
+            data: "test message".to_string(),
+            messageType: "text".to_string(),
+        };
+
+        let event = WsMessageEvent { message };
+
+        let json = serde_json::to_string(&event);
+        assert!(json.is_ok());
+    }
+
+    #[test]
+    fn test_session_event_has_correct_fields() {
+        // Test SessionEvent struct fields
+        use crate::proxy::http::HttpSession;
+
+        let session = HttpSession {
+            id: 42,
+            method: "POST".to_string(),
+            scheme: "http".to_string(),
+            host: "api.example.com".to_string(),
+            path: "/api/v1/users".to_string(),
+            url: "http://api.example.com/api/v1/users".to_string(),
+            status: 201,
+            statusText: "Created".to_string(),
+            contentType: Some("application/json".to_string()),
+            requestHeaders: vec![],
+            responseHeaders: vec![],
+            requestBody: Some("{}".to_string()),
+            responseBody: Some("{}".to_string()),
+            responseSize: Some(2),
+            duration: Some(100),
+            complete: true,
+        };
+
+        let event = SessionEvent {
+            event_type: "complete".to_string(),
+            session: session.clone(),
+        };
+
+        assert_eq!(event.event_type, "complete");
+        assert_eq!(event.session.id, 42);
+        assert_eq!(event.session.method, "POST");
+    }
+
+    #[test]
+    fn test_proxy_state_creation() {
+        // Test that ProxyState can be created
+        let state = ProxyState {
+            engine: Arc::new(Mutex::new(None)),
+        };
+
+        let engine_guard = state.engine.blocking_lock();
+        assert!(engine_guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_state_with_none_engine() {
+        // Test that ProxyState starts with None engine
+        let state = ProxyState {
+            engine: Arc::new(Mutex::new(None)),
+        };
+
+        let engine_guard = state.engine.lock().await;
+        assert!(engine_guard.is_none());
+    }
+
+    #[test]
+    fn test_session_event_clone() {
+        // Test that SessionEvent implements Clone
+        use crate::proxy::http::HttpSession;
+
+        let session = HttpSession {
+            id: 1,
+            method: "GET".to_string(),
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            path: "/".to_string(),
+            url: "https://example.com/".to_string(),
+            status: 200,
+            statusText: "OK".to_string(),
+            contentType: None,
+            requestHeaders: vec![],
+            responseHeaders: vec![],
+            requestBody: None,
+            responseBody: None,
+            responseSize: None,
+            duration: None,
+            complete: false,
+        };
+
+        let event = SessionEvent {
+            event_type: "start".to_string(),
+            session,
+        };
+
+        let cloned = event.clone();
+        assert_eq!(event.event_type, cloned.event_type);
+        assert_eq!(event.session.id, cloned.session.id);
+    }
+
+    #[test]
+    fn test_ws_message_event_clone() {
+        // Test that WsMessageEvent implements Clone
+        use crate::proxy::ws::WsMessage;
+
+        let message = WsMessage {
+            sessionId: 1,
+            timestamp: 12345,
+            direction: "received".to_string(),
+            data: "hello".to_string(),
+            messageType: "text".to_string(),
+        };
+
+        let event = WsMessageEvent { message: message.clone() };
+        let cloned = event.clone();
+
+        assert_eq!(event.message.sessionId, cloned.message.sessionId);
+        assert_eq!(event.message.data, cloned.message.data);
+    }
+
+    #[test]
+    fn test_session_event_debug_format() {
+        // Test that SessionEvent implements Debug
+        use crate::proxy::http::HttpSession;
+
+        let session = HttpSession {
+            id: 99,
+            method: "DELETE".to_string(),
+            scheme: "https".to_string(),
+            host: "test.com".to_string(),
+            path: "/resource".to_string(),
+            url: "https://test.com/resource".to_string(),
+            status: 204,
+            statusText: "No Content".to_string(),
+            contentType: None,
+            requestHeaders: vec![],
+            responseHeaders: vec![],
+            requestBody: None,
+            responseBody: None,
+            responseSize: Some(0),
+            duration: Some(25),
+            complete: true,
+        };
+
+        let event = SessionEvent {
+            event_type: "complete".to_string(),
+            session,
+        };
+
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("SessionEvent"));
+    }
+
+    #[test]
+    fn test_ws_message_event_debug_format() {
+        // Test that WsMessageEvent implements Debug
+        use crate::proxy::ws::WsMessage;
+
+        let message = WsMessage {
+            sessionId: 5,
+            timestamp: 67890,
+            direction: "sent".to_string(),
+            data: "ping".to_string(),
+            messageType: "ping".to_string(),
+        };
+
+        let event = WsMessageEvent { message };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("WsMessageEvent"));
+    }
+
+    #[test]
+    fn test_multiple_session_events() {
+        // Test creating multiple session events
+        use crate::proxy::http::HttpSession;
+
+        let sessions: Vec<SessionEvent> = (1..=5)
+            .map(|i| {
+                let session = HttpSession {
+                    id: i,
+                    method: "GET".to_string(),
+                    scheme: "https".to_string(),
+                    host: format!("example{}.com", i),
+                    path: "/".to_string(),
+                    url: format!("https://example{}.com/", i),
+                    status: 200,
+                    statusText: "OK".to_string(),
+                    contentType: None,
+                    requestHeaders: vec![],
+                    responseHeaders: vec![],
+                    requestBody: None,
+                    responseBody: None,
+                    responseSize: None,
+                    duration: None,
+                    complete: false,
+                };
+                SessionEvent {
+                    event_type: "start".to_string(),
+                    session,
+                }
+            })
+            .collect();
+
+        assert_eq!(sessions.len(), 5);
+        assert_eq!(sessions[0].session.id, 1);
+        assert_eq!(sessions[4].session.id, 5);
+    }
+
+    #[test]
+    fn test_session_event_different_types() {
+        // Test session events with different event types
+        use crate::proxy::http::HttpSession;
+
+        let session = HttpSession {
+            id: 1,
+            method: "GET".to_string(),
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            path: "/".to_string(),
+            url: "https://example.com/".to_string(),
+            status: 0,
+            statusText: String::new(),
+            contentType: None,
+            requestHeaders: vec![],
+            responseHeaders: vec![],
+            requestBody: None,
+            responseBody: None,
+            responseSize: None,
+            duration: None,
+            complete: false,
+        };
+
+        for event_type in &["start", "update", "complete", "error"] {
+            let event = SessionEvent {
+                event_type: event_type.to_string(),
+                session: session.clone(),
+            };
+            assert_eq!(event.event_type, *event_type);
+        }
     }
 }
