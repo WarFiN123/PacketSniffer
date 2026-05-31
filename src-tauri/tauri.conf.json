@@ -1,6 +1,6 @@
 {
   "productName": "PacketSniffer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.packetsniffer.net",
   "build": {
     "frontendDist": "../dist",
@@ -41,7 +41,13 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "targets": ["msi", "app", "dmg", "deb", "appimage"],
+    "targets": [
+      "msi",
+      "app",
+      "dmg",
+      "deb",
+      "appimage"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
