@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -99,6 +100,31 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
   const [reqTab, setReqTab] = useState<RequestTab>("Header");
   const [resTab, setResTab] = useState<ResponseTab>("Header");
 
+  // Bodies are stripped from the streamed session; fetch the full record (with
+  // bodies) on demand whenever the selection or its body availability changes.
+  const [fetched, setFetched] = useState<HttpSession | null>(null);
+  useEffect(() => {
+    if (!session || (!session.hasRequestBody && !session.hasResponseBody)) {
+      setFetched(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<HttpSession | null>("get_session", { id: session.id })
+      .then((full) => {
+        if (!cancelled) setFetched(full);
+      })
+      .catch(() => {
+        if (!cancelled) setFetched(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    session?.id,
+    session?.hasRequestBody,
+    session?.hasResponseBody,
+  ]);
+
   // Track the user's preferred tabs so we can restore them when switching requests
   const preferredReqTab = useRef<RequestTab>("Header");
   const preferredResTab = useRef<ResponseTab>("Header");
@@ -111,8 +137,8 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
     prevSessionId.current = session.id;
 
     const isWs = session.scheme === "ws" || session.scheme === "wss";
-    const hasReqBody = !!session.requestBody;
-    const hasResBody = !!session.responseBody;
+    const hasReqBody = session.hasRequestBody;
+    const hasResBody = session.hasResponseBody;
     const queryParams = parseQueryParams(session.path);
     const hasQuery = queryParams.length > 0;
     const hasReqCookies = session.requestHeaders.some(
@@ -168,11 +194,16 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
     );
   }
 
+  // Render bodies/exports from the fetched full record when available, falling
+  // back to the slim streamed session (metadata + body-presence flags).
+  const view =
+    fetched && fetched.id === session.id ? fetched : session;
+
   const isWs = session.scheme === "ws" || session.scheme === "wss";
   const queryParams = parseQueryParams(session.path);
   const hasQuery = queryParams.length > 0;
-  const hasReqBody = !!session.requestBody;
-  const hasResBody = !!session.responseBody;
+  const hasReqBody = session.hasRequestBody;
+  const hasResBody = session.hasResponseBody;
   const isJson = (session.contentType || "").includes("json");
 
   const requestCookies = session.requestHeaders
@@ -238,7 +269,7 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
             </ContextMenuItem>
           )}
           <ContextMenuSeparator />
-          <ContextMenuItem onClick={() => exportToPostman(session)}>
+          <ContextMenuItem onClick={() => exportToPostman(view)}>
             Open in Postman
           </ContextMenuItem>
         </ContextMenuContent>
@@ -286,14 +317,14 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="text-[12px] min-w-32">
                 <DropdownMenuItem
-                  onClick={() => handleCopy(getRawRequest(session))}
+                  onClick={() => handleCopy(getRawRequest(view))}
                 >
                   Copy Raw Request
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => exportRequest(session)}>
+                <DropdownMenuItem onClick={() => exportRequest(view)}>
                   Export Request
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => exportToPostman(session)}>
+                <DropdownMenuItem onClick={() => exportToPostman(view)}>
                   Open in Postman
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -362,13 +393,19 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
                 </table>
               </div>
             )}
-            {reqTab === "Body" && session.requestBody && (
-              <BodyViewer
-                body={session.requestBody}
-                isJson={isJson}
-                contentType={session.contentType || ""}
-              />
-            )}
+            {reqTab === "Body" &&
+              (view.requestBody ? (
+                <BodyViewer
+                  body={view.requestBody}
+                  isJson={isJson}
+                  contentType={view.contentType || ""}
+                />
+              ) : (
+                <div className="p-4 text-[11px] text-muted-foreground flex items-center gap-1">
+                  <Spinner size={14} />
+                  <span>Loading body…</span>
+                </div>
+              ))}
           </ScrollArea>
         </div>
 
@@ -413,11 +450,11 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="text-[12px] min-w-32">
                 <DropdownMenuItem
-                  onClick={() => handleCopy(getRawResponse(session))}
+                  onClick={() => handleCopy(getRawResponse(view))}
                 >
                   Copy Raw Response
                 </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => exportResponse(session)}>
+                <DropdownMenuItem onClick={() => exportResponse(view)}>
                   Export Response
                 </DropdownMenuItem>
               </DropdownMenuContent>
@@ -457,13 +494,19 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
                 </table>
               </div>
             )}
-            {resTab === "Body" && session.responseBody && (
-              <BodyViewer
-                body={session.responseBody}
-                isJson={isJson}
-                contentType={session.contentType || ""}
-              />
-            )}
+            {resTab === "Body" &&
+              (view.responseBody ? (
+                <BodyViewer
+                  body={view.responseBody}
+                  isJson={isJson}
+                  contentType={view.contentType || ""}
+                />
+              ) : (
+                <div className="p-4 text-[11px] text-muted-foreground flex items-center gap-1">
+                  <Spinner size={14} />
+                  <span>Loading body…</span>
+                </div>
+              ))}
             {resTab === "Messages" && <MessagesTab messages={wsMessages} />}
 
             {!session.complete && (

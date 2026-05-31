@@ -33,10 +33,18 @@ pub struct HttpSession {
     pub complete: bool,
     pub request_headers: Vec<HttpHeader>,
     pub response_headers: Vec<HttpHeader>,
-    /// Request body as UTF-8 string (truncated to 256 KB for UI transport)
+    /// Request body as UTF-8 string (truncated to 256 KB for UI transport).
+    /// Stripped from the live `proxy-session` event stream; fetched on demand
+    /// via the `get_session` command when a row is inspected.
     pub request_body: Option<String>,
-    /// Response body as UTF-8 string (truncated to 256 KB for UI transport)
+    /// Response body as UTF-8 string (truncated to 256 KB for UI transport).
+    /// Stripped from the live event stream; fetched on demand.
     pub response_body: Option<String>,
+    /// Whether a displayable request body exists (kept in the slim event so the
+    /// UI can show the Body tab without transporting the body itself).
+    pub has_request_body: bool,
+    /// Whether a displayable response body exists.
+    pub has_response_body: bool,
 }
 
 impl HttpSession {
@@ -52,6 +60,8 @@ impl HttpSession {
         body_size: usize,
         request_body: Option<Vec<u8>>,
     ) -> Self {
+        let request_body = request_body.and_then(|b| body_for_ui(&b, None, None));
+        let has_request_body = request_body.is_some();
         Self {
             id,
             scheme: scheme.to_string(),
@@ -70,8 +80,10 @@ impl HttpSession {
             complete: false,
             request_headers: headers,
             response_headers: Vec::new(),
-            request_body: request_body.and_then(|b| body_for_ui(&b, None, None)),
+            request_body,
             response_body: None,
+            has_request_body,
+            has_response_body: false,
         }
     }
 
@@ -99,6 +111,37 @@ impl HttpSession {
             find_header(&self.response_headers, "Content-Encoding").map(|s| s.to_string());
         self.response_body =
             response_body.and_then(|b| body_for_ui(&b, Some(content_type), encoding.as_deref()));
+        self.has_response_body = self.response_body.is_some();
+    }
+
+    /// Clone everything except the (potentially large) body strings. Used to
+    /// build the slim payload pushed over the `proxy-session` event stream;
+    /// the body presence flags are preserved so the UI can still offer Body
+    /// tabs and fetch the full bodies on demand.
+    pub fn metadata_clone(&self) -> Self {
+        Self {
+            id: self.id,
+            scheme: self.scheme.clone(),
+            method: self.method.clone(),
+            host: self.host.clone(),
+            path: self.path.clone(),
+            url: self.url.clone(),
+            http_version: self.http_version.clone(),
+            status: self.status,
+            status_text: self.status_text.clone(),
+            resp_http_version: self.resp_http_version.clone(),
+            content_type: self.content_type.clone(),
+            request_size: self.request_size,
+            response_size: self.response_size,
+            duration: self.duration,
+            complete: self.complete,
+            request_headers: self.request_headers.clone(),
+            response_headers: self.response_headers.clone(),
+            request_body: None,
+            response_body: None,
+            has_request_body: self.has_request_body,
+            has_response_body: self.has_response_body,
+        }
     }
 }
 

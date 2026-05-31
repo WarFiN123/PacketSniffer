@@ -11,23 +11,28 @@ export default defineConfig({
     alias: {
       "@": path.resolve(__dirname, "./src"),
     },
+    // CodeMirror requires a SINGLE instance of these singleton packages;
+    // duplicate copies break instanceof checks ("Unrecognized extension value").
+    dedupe: [
+      "@codemirror/state",
+      "@codemirror/view",
+      "@codemirror/language",
+    ],
   },
   clearScreen: false, // tauri logs remain visible
 
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
-          codemirror: [
-            "@uiw/react-codemirror",
-            "@codemirror/lang-json",
-            "@codemirror/lang-html",
-            "@codemirror/lang-xml",
-            "@codemirror/lang-javascript",
-            "@codemirror/language",
-            "@codemirror/view",
-            "@lezer/highlight",
-          ],
+        // rolldown-vite (Vite 8) requires manualChunks as a function.
+        manualChunks(id) {
+          if (
+            id.includes("@uiw/react-codemirror") ||
+            id.includes("@codemirror/") ||
+            id.includes("@lezer/")
+          ) {
+            return "codemirror";
+          }
         },
       },
     },

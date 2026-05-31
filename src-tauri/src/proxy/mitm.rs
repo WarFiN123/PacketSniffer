@@ -9,6 +9,7 @@
 
 use super::ca::CertificateAuthority;
 use super::http::{self, HttpHeader, HttpSession};
+use super::intercept::{self, MapKind};
 use super::ws::{self, WsMessage};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -229,11 +230,39 @@ async fn handle_mitm_normal(
     on_event("start", session.clone());
     let start = std::time::Instant::now();
 
+    // ── Interception: block / allow + request mapping ───────────────────
+    let full_url = format!("https://{}{}", host, path);
+    if intercept::is_blocked(&full_url) {
+        let mut s = session;
+        s.finish(403, "Blocked", "HTTP/1.1", "text/plain", 0, ms(&start), Vec::new(),
+            Some(b"Blocked by PacketSniffer".to_vec()));
+        on_event("finish", s);
+        return Ok(err_resp(403, "Blocked by PacketSniffer"));
+    }
+
+    let (mut eff_host, mut eff_port, mut eff_path) =
+        (hostname.to_string(), port, path.clone());
+    if let Some((kind, target)) = intercept::map_for(&full_url) {
+        match kind {
+            MapKind::Local => {
+                return Ok(serve_map_local_box(&target, session, &start, on_event).await);
+            }
+            MapKind::Remote => {
+                // Only https:// targets are supported on the TLS path.
+                if let Some((h, p, pth)) = parse_https_target(&target) {
+                    eff_host = h;
+                    eff_port = p;
+                    eff_path = pth;
+                }
+            }
+        }
+    }
+
     // Connect upstream TLS
-    let tls_stream = match connect_upstream_tls(hostname, port).await {
+    let tls_stream = match connect_upstream_tls(&eff_host, eff_port).await {
         Ok(s) => s,
         Err(e) => {
-            log::error!("Upstream TLS failed for {}:{}: {}", hostname, port, e);
+            log::error!("Upstream TLS failed for {}:{}: {}", eff_host, eff_port, e);
             let mut s = session;
             s.finish(0, "", "", "", 0, ms(&start), Vec::new(), None);
             on_event("finish", s);
@@ -245,9 +274,9 @@ async fn handle_mitm_normal(
     let upstream_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
 
     if upstream_h2 {
-        forward_h2(tls_stream, &method, &path, hostname, port, &raw_headers, req_body, session, start, on_event).await
+        forward_h2(tls_stream, &method, &eff_path, &eff_host, eff_port, &raw_headers, req_body, session, start, on_event).await
     } else {
-        forward_h1(tls_stream, &method, &path, &raw_headers, req_body, session, start, hostname, on_event).await
+        forward_h1(tls_stream, &method, &eff_path, &raw_headers, req_body, session, start, &eff_host, on_event).await
     }
 }
 
@@ -294,10 +323,37 @@ async fn handle_mitm_h2_request(
     on_event("start", session.clone());
     let start = std::time::Instant::now();
 
-    let tls_stream = match connect_upstream_tls(hostname, port).await {
+    // ── Interception: block / allow + request mapping ───────────────────
+    let full_url = format!("https://{}{}", host, path);
+    if intercept::is_blocked(&full_url) {
+        let mut s = session;
+        s.finish(403, "Blocked", "HTTP/1.1", "text/plain", 0, ms(&start), Vec::new(),
+            Some(b"Blocked by PacketSniffer".to_vec()));
+        on_event("finish", s);
+        return Ok(err_resp(403, "Blocked by PacketSniffer"));
+    }
+
+    let (mut eff_host, mut eff_port, mut eff_path) =
+        (hostname.to_string(), port, path.clone());
+    if let Some((kind, target)) = intercept::map_for(&full_url) {
+        match kind {
+            MapKind::Local => {
+                return Ok(serve_map_local_box(&target, session, &start, on_event).await);
+            }
+            MapKind::Remote => {
+                if let Some((h, p, pth)) = parse_https_target(&target) {
+                    eff_host = h;
+                    eff_port = p;
+                    eff_path = pth;
+                }
+            }
+        }
+    }
+
+    let tls_stream = match connect_upstream_tls(&eff_host, eff_port).await {
         Ok(s) => s,
         Err(e) => {
-            log::error!("Upstream TLS failed for {}:{}: {}", hostname, port, e);
+            log::error!("Upstream TLS failed for {}:{}: {}", eff_host, eff_port, e);
             let mut s = session;
             s.finish(0, "", "", "", 0, ms(&start), Vec::new(), None);
             on_event("finish", s);
@@ -308,9 +364,9 @@ async fn handle_mitm_h2_request(
     let upstream_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
 
     if upstream_h2 {
-        forward_h2(tls_stream, &method, &path, hostname, port, &raw_headers, req_body, session, start, on_event).await
+        forward_h2(tls_stream, &method, &eff_path, &eff_host, eff_port, &raw_headers, req_body, session, start, on_event).await
     } else {
-        forward_h1(tls_stream, &method, &path, &raw_headers, req_body, session, start, hostname, on_event).await
+        forward_h1(tls_stream, &method, &eff_path, &raw_headers, req_body, session, start, &eff_host, on_event).await
     }
 }
 
@@ -517,15 +573,11 @@ async fn forward_h1(
 
     let mut builder = Request::builder().method(method).uri(path).version(hyper::Version::HTTP_11);
 
-    // Ensure Host header is present — HTTP/1.1 requires it. hyper's server may
-    // parse it out of the incoming request and not put it in the HeaderMap.
-    let has_host = raw_headers.contains_key("host");
-    if !has_host {
-        builder = builder.header("host", hostname);
-    }
-
     // Forward headers directly from the raw HeaderMap — lossless, preserves
     // non-visible-ASCII bytes in cookie/auth values that to_str() would reject.
+    // Host is set explicitly below so remote-mapped requests target the new
+    // host (for normal requests `hostname` equals the original host).
+    let no_cache = intercept::no_cache();
     for (name, value) in raw_headers.iter() {
         let name_str = name.as_str();
         // Strip hop-by-hop and framing headers. hyper sets Content-Length
@@ -536,11 +588,17 @@ async fn forward_h1(
             || name_str.eq_ignore_ascii_case("keep-alive")
             || name_str.eq_ignore_ascii_case("proxy-connection")
             || name_str.eq_ignore_ascii_case("proxy-authorization")
+            || name_str.eq_ignore_ascii_case("host")
         {
+            continue;
+        }
+        // No-Cache: drop conditional headers so the server returns a fresh 200.
+        if no_cache && intercept::is_conditional_header(name_str) {
             continue;
         }
         builder = builder.header(name.clone(), value.clone());
     }
+    builder = builder.header("host", hostname);
 
     let upstream_req = builder.body(Full::new(req_body)).unwrap();
     match sender.send_request(upstream_req).await {
@@ -588,6 +646,7 @@ async fn forward_h2(
     };
 
     let mut builder = Request::builder().method(method).uri(&full_uri);
+    let no_cache = intercept::no_cache();
     for (name, value) in raw_headers.iter() {
         let name_str = name.as_str();
         // Skip hop-by-hop and framing headers invalid in HTTP/2
@@ -600,6 +659,9 @@ async fn forward_h2(
             || name_str.eq_ignore_ascii_case("proxy-authorization")
             || name_str.eq_ignore_ascii_case("host") // :authority replaces Host in h2
         {
+            continue;
+        }
+        if no_cache && intercept::is_conditional_header(name_str) {
             continue;
         }
         builder = builder.header(name.clone(), value.clone());
@@ -635,6 +697,9 @@ async fn stream_response(
     let raw_resp_headers = resp.headers().clone();
     let headers = http::headers_from_hyper(&raw_resp_headers);
     let ct = http::find_header(&headers, "content-type").unwrap_or("").to_string();
+
+    // Network-condition simulation (added latency + download throttle).
+    let (latency_ms, kbps) = intercept::throttle();
 
     // Create a channel for streaming body to the client
     // Buffer of 64 frames to avoid back-pressure stalling the upstream read
@@ -680,6 +745,14 @@ async fn stream_response(
                             log::debug!("Client disconnected during body stream for {}{}", session.host, session.path);
                             break;
                         }
+
+                        // Bandwidth throttle: pace delivery by chunk size.
+                        if kbps > 0 {
+                            let pace_ms = ((chunk_len as u64) * 8) / (kbps as u64).max(1);
+                            if pace_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(pace_ms)).await;
+                            }
+                        }
                     } else if frame.is_trailers() {
                         // Forward trailers
                         let _ = body_tx.send(Ok(frame)).await;
@@ -712,6 +785,11 @@ async fn stream_response(
         );
         on_event("finish", session);
     });
+
+    // Latency simulation: hold the response headers before delivery.
+    if latency_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(latency_ms)).await;
+    }
 
     Ok(client_resp.body(stream_body(body_rx)).unwrap())
 }
@@ -775,6 +853,66 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// Serve a local file in place of the upstream response (Map Local rule).
+async fn serve_map_local_box(
+    path: &str,
+    mut session: HttpSession,
+    start: &std::time::Instant,
+    on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
+) -> Response<BoxBody> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            let ct = intercept::guess_content_type(path);
+            let headers = vec![
+                HttpHeader { name: "Content-Type".to_string(), value: ct.to_string() },
+                HttpHeader { name: "Content-Length".to_string(), value: bytes.len().to_string() },
+                HttpHeader { name: "X-PacketSniffer-Map".to_string(), value: "local".to_string() },
+            ];
+            session.finish(200, "OK", "HTTP/1.1", ct, bytes.len(),
+                ms(start), headers.clone(), Some(bytes.clone()));
+            on_event("finish", session);
+            intercept::apply_throttle_total(bytes.len()).await;
+
+            let mut resp = Response::builder().status(200);
+            for h in &headers {
+                if let (Ok(n), Ok(v)) = (
+                    hyper::header::HeaderName::from_bytes(h.name.as_bytes()),
+                    hyper::header::HeaderValue::from_str(&h.value),
+                ) {
+                    resp = resp.header(n, v);
+                }
+            }
+            resp.body(full_body(Bytes::from(bytes))).unwrap()
+        }
+        Err(e) => {
+            let msg = format!("Map Local file error: {}", e);
+            session.finish(502, "Bad Gateway", "HTTP/1.1", "text/plain", 0,
+                ms(start), Vec::new(), Some(msg.clone().into_bytes()));
+            on_event("finish", session);
+            err_resp(502, &msg)
+        }
+    }
+}
+
+/// Parse an `https://host[:port]/path` Map Remote target. Returns `None` for
+/// non-https targets (the TLS path can't downgrade to plaintext).
+fn parse_https_target(target: &str) -> Option<(String, u16, String)> {
+    let rest = target.trim().strip_prefix("https://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(443)),
+        None => (authority.to_string(), 443),
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some((host, port, path))
+    }
 }
 
 // ─── Tokio executor for hyper ───────────────────────────────────────────────

@@ -8,6 +8,11 @@ import type {
   WsMessageEvent,
 } from "../types";
 
+/** Keep at most this many sessions in the UI. Matches the server-side
+ *  `MAX_SESSIONS` cap so any row still visible can have its bodies fetched
+ *  back. Bounds memory during very long capture runs. */
+const MAX_SESSIONS = 5000;
+
 /* ─── Batched proxy session hook ─────────────────────────────────────────────
  * Collects all proxy-session events that arrive within a single animation
  * frame and flushes them as one React state update, dramatically reducing
@@ -22,6 +27,9 @@ export function useProxySessions() {
   const pendingUpdates = useRef<HttpSession[]>([]);
   const pendingStarts = useRef<number[]>([]);
   const rafId = useRef<number | null>(null);
+  // Canonical order, mirrored here so eviction is computed deterministically
+  // (independent of React's per-hook state-update ordering).
+  const orderRef = useRef<number[]>([]);
 
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
@@ -36,17 +44,30 @@ export function useProxySessions() {
 
       if (updates.length === 0) return;
 
+      // Grow the canonical order and compute oldest-first eviction up front so
+      // both state updates below agree on which ids to drop.
+      let evicted: number[] = [];
+      if (starts.length > 0) {
+        let nextOrder = orderRef.current.concat(starts);
+        if (nextOrder.length > MAX_SESSIONS) {
+          const overflow = nextOrder.length - MAX_SESSIONS;
+          evicted = nextOrder.slice(0, overflow);
+          nextOrder = nextOrder.slice(overflow);
+        }
+        orderRef.current = nextOrder;
+        setOrder(nextOrder);
+      }
+
       setSessions((prev) => {
         const next = new Map(prev);
         for (const session of updates) {
           next.set(session.id, session);
         }
+        for (const id of evicted) {
+          next.delete(id);
+        }
         return next;
       });
-
-      if (starts.length > 0) {
-        setOrder((prev) => [...prev, ...starts]);
-      }
     };
 
     listen<SessionEvent>("proxy-session", (event) => {
@@ -98,6 +119,7 @@ export function useProxySessions() {
   }, []);
 
   const clear = useCallback(() => {
+    orderRef.current = [];
     setSessions(new Map());
     setOrder([]);
   }, []);

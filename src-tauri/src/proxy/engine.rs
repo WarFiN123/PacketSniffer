@@ -6,6 +6,7 @@
 
 use super::ca::CertificateAuthority;
 use super::http::{self, HttpHeader, HttpSession};
+use super::intercept::{self, MapKind};
 use super::mitm;
 use super::ws::{self, WsMessage};
 use bytes::Bytes;
@@ -257,7 +258,34 @@ async fn handle_plain_http(
     on_event("start", session.clone());
     let start_time = std::time::Instant::now();
 
-    let (hostname, port) = parse_host_port(&host, 80);
+    // ── Interception: block / allow list ────────────────────────────────
+    if intercept::is_blocked(&full_url) {
+        session.finish(403, "Blocked", "HTTP/1.1", "text/plain", 0,
+            elapsed_ms(&start_time), Vec::new(), Some(b"Blocked by PacketSniffer".to_vec()));
+        on_event("finish", session);
+        return error_response(403, "Blocked by PacketSniffer");
+    }
+
+    // Upstream target defaults to the original host/path; map rules may override.
+    let (mut hostname, mut port) = parse_host_port(&host, 80);
+    let mut upstream_path = extract_path_from_url(&full_url);
+
+    if let Some((kind, target)) = intercept::map_for(&full_url) {
+        match kind {
+            MapKind::Local => {
+                return serve_map_local_http(&target, &mut session, &start_time, &on_event).await;
+            }
+            MapKind::Remote => {
+                // Only http:// targets are supported on the plain-HTTP path.
+                if let Some((h, p, pth)) = parse_http_target(&target) {
+                    hostname = h;
+                    port = p;
+                    upstream_path = pth;
+                }
+            }
+        }
+    }
+
     if hostname.is_empty() {
         session.finish(502, "Bad Gateway", "", "", 0, elapsed_ms(&start_time), Vec::new(), None);
         on_event("finish", session);
@@ -293,17 +321,23 @@ async fn handle_plain_http(
         }
     });
 
-    // Build upstream request with relative path
-    let upstream_path = extract_path_from_url(&full_url);
+    // Build upstream request with the (possibly remapped) relative path.
     let mut builder = Request::builder()
         .method(method.as_str())
         .uri(&upstream_path)
         .version(hyper::Version::HTTP_11);
 
+    let no_cache = intercept::no_cache();
     for h in &req_headers {
         if h.name.eq_ignore_ascii_case("proxy-connection")
             || h.name.eq_ignore_ascii_case("proxy-authorization")
+            // Host is set explicitly below so remote-mapped requests target the
+            // new host rather than the original.
+            || h.name.eq_ignore_ascii_case("host")
         {
+            continue;
+        }
+        if no_cache && intercept::is_conditional_header(&h.name) {
             continue;
         }
         if let (Ok(n), Ok(v)) = (
@@ -313,6 +347,13 @@ async fn handle_plain_http(
             builder = builder.header(n, v);
         }
     }
+
+    let host_value = if port == 80 {
+        hostname.clone()
+    } else {
+        format!("{}:{}", hostname, port)
+    };
+    builder = builder.header("host", host_value);
 
     let upstream_req = builder.body(Full::new(req_body_bytes)).unwrap();
 
@@ -351,6 +392,8 @@ async fn handle_plain_http(
     );
     on_event("finish", session);
 
+    // Network-condition simulation (latency + bandwidth) for the buffered path.
+    intercept::apply_throttle_total(resp_body_bytes.len()).await;
     build_response(resp_status, &resp_headers, resp_body_bytes)
 }
 
@@ -565,6 +608,56 @@ fn build_response(status: u16, headers: &[HttpHeader], body: Bytes) -> Response<
 
 fn build_response_with_body(status: u16, headers: &[HttpHeader], body: &[u8]) -> Response<Full<Bytes>> {
     build_response(status, headers, Bytes::from(body.to_vec()))
+}
+
+/// Serve a local file in place of the upstream response (Map Local rule).
+async fn serve_map_local_http(
+    path: &str,
+    session: &mut HttpSession,
+    start: &std::time::Instant,
+    on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
+) -> Response<Full<Bytes>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            let ct = intercept::guess_content_type(path);
+            let headers = vec![
+                HttpHeader { name: "Content-Type".to_string(), value: ct.to_string() },
+                HttpHeader { name: "Content-Length".to_string(), value: bytes.len().to_string() },
+                HttpHeader { name: "X-PacketSniffer-Map".to_string(), value: "local".to_string() },
+            ];
+            session.finish(200, "OK", "HTTP/1.1", ct, bytes.len(),
+                elapsed_ms(start), headers.clone(), Some(bytes.clone()));
+            on_event("finish", session.clone());
+            intercept::apply_throttle_total(bytes.len()).await;
+            build_response(200, &headers, Bytes::from(bytes))
+        }
+        Err(e) => {
+            let msg = format!("Map Local file error: {}", e);
+            session.finish(502, "Bad Gateway", "HTTP/1.1", "text/plain", 0,
+                elapsed_ms(start), Vec::new(), Some(msg.clone().into_bytes()));
+            on_event("finish", session.clone());
+            error_response(502, &msg)
+        }
+    }
+}
+
+/// Parse an `http://host[:port]/path` Map Remote target. Returns `None` for
+/// non-http targets (the plain-HTTP path can't open a TLS upstream).
+fn parse_http_target(target: &str) -> Option<(String, u16, String)> {
+    let rest = target.trim().strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
+        None => (authority.to_string(), 80),
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some((host, port, path))
+    }
 }
 
 fn parse_connect_target(target: &str) -> (String, u16) {

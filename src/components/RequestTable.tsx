@@ -1,4 +1,5 @@
-import { useRef, useEffect, useCallback, memo } from "react";
+import { useRef, useEffect, useState, useCallback, memo } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { formatSize, formatTime, shortType } from "@/lib/utils";
@@ -29,6 +30,68 @@ interface RequestTableProps {
 
 const ROW_HEIGHT = 24;
 
+// Column layout. `dot`/`pin` are fixed; the rest are user-resizable. A trailing
+// filler column absorbs slack so the grid fills the pane without stretching the
+// data columns. Total cells per row = COL_IDS.length + 1 (filler).
+const COL_IDS = [
+  "dot",
+  "pin",
+  "id",
+  "url",
+  "method",
+  "status",
+  "type",
+  "size",
+  "time",
+] as const;
+type ColId = (typeof COL_IDS)[number];
+
+const DEFAULT_WIDTHS: Record<ColId, number> = {
+  dot: 28,
+  pin: 28,
+  id: 56,
+  url: 460,
+  method: 72,
+  status: 96,
+  type: 72,
+  size: 84,
+  time: 84,
+};
+const MIN_WIDTHS: Partial<Record<ColId, number>> = {
+  id: 40,
+  url: 140,
+  method: 52,
+  status: 64,
+  type: 52,
+  size: 56,
+  time: 56,
+};
+const RESIZABLE = new Set<ColId>([
+  "id",
+  "url",
+  "method",
+  "status",
+  "type",
+  "size",
+  "time",
+]);
+const COL_SPAN = COL_IDS.length + 1; // + filler
+const WIDTHS_KEY = "ps_col_widths";
+
+function ResizeHandle({
+  onMouseDown,
+}: {
+  onMouseDown: (e: React.MouseEvent) => void;
+}) {
+  return (
+    <div
+      onMouseDown={onMouseDown}
+      onClick={(e) => e.stopPropagation()}
+      className="absolute top-0 -right-[3px] z-20 h-full w-1.5 cursor-col-resize select-none hover:bg-primary/50 active:bg-primary/70"
+    />
+  );
+}
+
 function dotClass(s: HttpSession): string {
   if (!s.complete) return "bg-orange-400";
   if (s.status === 0) return "bg-muted-foreground";
@@ -45,6 +108,7 @@ interface RowProps {
   onSelect: (id: number | null) => void;
   onTogglePin: (id: number) => void;
   onCopy: (text: string) => void;
+  onExport: (s: HttpSession, fn: (full: HttpSession) => void) => void;
 }
 
 const RequestRow = memo(function RequestRow({
@@ -55,6 +119,7 @@ const RequestRow = memo(function RequestRow({
   onSelect,
   onTogglePin,
   onCopy,
+  onExport,
 }: RowProps) {
   const fullUrl = getFullUrl(s);
 
@@ -91,7 +156,7 @@ const RequestRow = memo(function RequestRow({
             {s.id}
           </td>
 
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary max-w-0 w-full truncate">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary truncate">
             <span
               className={cn(
                 "font-medium",
@@ -142,9 +207,12 @@ const RequestRow = memo(function RequestRow({
           </td>
 
           {/* Duration */}
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary tabular-nums text-right whitespace-nowrap">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums text-right whitespace-nowrap">
             {s.duration ? formatTime(s.duration) : (!s.complete ? <div className="flex items-center justify-end opacity-40 h-full"><Spinner size={10} /></div> : "")}
           </td>
+
+          {/* Filler — absorbs slack so the grid fills the pane */}
+          <td className="h-6 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary" />
         </tr>
       </ContextMenuTrigger>
       <ContextMenuContent className="text-[12px] min-w-48">
@@ -159,13 +227,13 @@ const RequestRow = memo(function RequestRow({
           Copy Path
         </ContextMenuItem>
         <ContextMenuSeparator />
-        <ContextMenuItem onClick={() => exportToPostman(s)}>
+        <ContextMenuItem onClick={() => onExport(s, exportToPostman)}>
           Open in Postman
         </ContextMenuItem>
-        <ContextMenuItem onClick={() => exportRequest(s)}>
+        <ContextMenuItem onClick={() => onExport(s, exportRequest)}>
           Export Request...
         </ContextMenuItem>
-        <ContextMenuItem onClick={() => exportResponse(s)}>
+        <ContextMenuItem onClick={() => onExport(s, exportResponse)}>
           Export Response...
         </ContextMenuItem>
       </ContextMenuContent>
@@ -183,6 +251,55 @@ export default function RequestTable({
 }: RequestTableProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
+
+  // Resizable column widths (persisted to localStorage).
+  const [widths, setWidths] = useState<Record<string, number>>(() => {
+    try {
+      const saved = localStorage.getItem(WIDTHS_KEY);
+      if (saved) return { ...DEFAULT_WIDTHS, ...JSON.parse(saved) };
+    } catch {
+      // ignore
+    }
+    return { ...DEFAULT_WIDTHS };
+  });
+  const widthsRef = useRef(widths);
+  widthsRef.current = widths;
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(WIDTHS_KEY, JSON.stringify(widths));
+    } catch {
+      // ignore
+    }
+  }, [widths]);
+
+  const startResize = useCallback((e: React.MouseEvent, colId: ColId) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startW = widthsRef.current[colId] ?? DEFAULT_WIDTHS[colId];
+    const min = MIN_WIDTHS[colId] ?? 40;
+
+    const onMove = (ev: MouseEvent) => {
+      const next = Math.max(min, startW + (ev.clientX - startX));
+      setWidths((w) => ({ ...w, [colId]: next }));
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, []);
+
+  const totalWidth = COL_IDS.reduce(
+    (sum, id) => sum + (widths[id] ?? DEFAULT_WIDTHS[id]),
+    0,
+  );
 
   const virtualizer = useVirtualizer({
     count: order.length,
@@ -213,6 +330,26 @@ export default function RequestTable({
     }
   }, []);
 
+  // Bodies aren't in the streamed session, so fetch the full record before
+  // running a body-bearing export (Postman / Export Request / Export Response).
+  const handleExport = useCallback(
+    async (s: HttpSession, fn: (full: HttpSession) => void) => {
+      if (!s.hasRequestBody && !s.hasResponseBody) {
+        fn(s);
+        return;
+      }
+      try {
+        const full = await invoke<HttpSession | null>("get_session", {
+          id: s.id,
+        });
+        fn(full ?? s);
+      } catch {
+        fn(s);
+      }
+    },
+    [],
+  );
+
   const virtualItems = virtualizer.getVirtualItems();
 
   return (
@@ -222,41 +359,52 @@ export default function RequestTable({
         ref={containerRef}
         onScroll={handleScroll}
       >
-        <table className="w-full text-left border-separate border-spacing-0 select-none outline-none table-fixed">
+        <table
+          className="text-left border-separate border-spacing-0 select-none outline-none table-fixed w-full"
+          style={{ minWidth: totalWidth }}
+        >
+          <colgroup>
+            {COL_IDS.map((id) => (
+              <col key={id} style={{ width: widths[id] ?? DEFAULT_WIDTHS[id] }} />
+            ))}
+            <col />
+          </colgroup>
           <thead className="sticky top-0 z-10 bg-panel-header shadow-sm">
             <tr className="text-[11px] text-muted-foreground font-medium">
-              <th className="font-normal px-2 h-6 w-6 border-b border-r border-border text-center"></th>
-              <th className="font-normal px-2 h-6 w-6 border-b border-r border-border text-center">
-                📌
-              </th>
-              <th className="font-normal px-2 h-6 w-12 border-b border-r border-border">
-                ID
-              </th>
-              <th className="font-normal px-2 h-6 border-b border-r border-border">
-                URL
-              </th>
-              <th className="font-normal px-2 h-6 w-16 border-b border-r border-border">
-                Method
-              </th>
-              <th className="font-normal px-2 h-6 w-20 border-b border-r border-border">
-                Status
-              </th>
-              <th className="font-normal px-2 h-6 w-16 border-b border-border">
-                Type
-              </th>
-              <th className="font-normal px-2 h-6 w-20 border-b border-r border-border whitespace-nowrap">
-                Size
-              </th>
-              <th className="font-normal px-2 h-6 w-20 border-b border-border whitespace-nowrap">
-                Time
-              </th>
+              {(
+                [
+                  ["dot", ""],
+                  ["pin", "📌"],
+                  ["id", "ID"],
+                  ["url", "URL"],
+                  ["method", "Method"],
+                  ["status", "Status"],
+                  ["type", "Type"],
+                  ["size", "Size"],
+                  ["time", "Time"],
+                ] as [ColId, string][]
+              ).map(([id, label]) => (
+                <th
+                  key={id}
+                  className={cn(
+                    "relative font-normal px-2 h-6 border-b border-r border-border whitespace-nowrap",
+                    (id === "dot" || id === "pin") && "text-center",
+                  )}
+                >
+                  {label}
+                  {RESIZABLE.has(id) && (
+                    <ResizeHandle onMouseDown={(e) => startResize(e, id)} />
+                  )}
+                </th>
+              ))}
+              <th className="border-b border-border h-6" />
             </tr>
           </thead>
           <tbody>
             {order.length === 0 ? (
               <tr>
                 <td
-                  colSpan={9}
+                  colSpan={COL_SPAN}
                   className="text-center py-8 text-muted-foreground text-xs"
                 >
                   No requests captured
@@ -267,7 +415,7 @@ export default function RequestTable({
                 {/* Top spacer row for virtualization */}
                 {virtualItems.length > 0 && virtualItems[0].start > 0 && (
                   <tr>
-                    <td colSpan={9} style={{ height: virtualItems[0].start }} />
+                    <td colSpan={COL_SPAN} style={{ height: virtualItems[0].start }} />
                   </tr>
                 )}
 
@@ -286,6 +434,7 @@ export default function RequestTable({
                       onSelect={onSelect}
                       onTogglePin={onTogglePin}
                       onCopy={handleCopy}
+                      onExport={handleExport}
                     />
                   );
                 })}
@@ -294,7 +443,7 @@ export default function RequestTable({
                 {virtualItems.length > 0 && (
                   <tr>
                     <td
-                      colSpan={9}
+                      colSpan={COL_SPAN}
                       style={{
                         height:
                           virtualizer.getTotalSize() -

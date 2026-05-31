@@ -21,8 +21,14 @@ export interface HttpSession {
   complete: boolean;
   requestHeaders: HttpHeader[];
   responseHeaders: HttpHeader[];
+  // Bodies are stripped from the live event stream to keep it small; they are
+  // null on streamed sessions and only populated when fetched via `get_session`.
   requestBody: string | null;
   responseBody: string | null;
+  // Present on every streamed session so the UI knows whether a Body tab should
+  // be shown without transporting the body itself.
+  hasRequestBody: boolean;
+  hasResponseBody: boolean;
 }
 
 export interface SessionEvent {

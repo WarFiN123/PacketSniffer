@@ -12,6 +12,7 @@ import {
 import Toolbar from "./components/Toolbar";
 import ContentFilterBar, {
   type ContentFilter,
+  type StatusClass,
 } from "./components/ContentFilterBar";
 import Sidebar from "./components/Sidebar";
 import RequestTable from "./components/RequestTable";
@@ -22,7 +23,12 @@ import AboutDialog from "./components/AboutDialog";
 import UpdateDialog from "./components/UpdateDialog";
 import CaInstallDialog from "./components/CaInstallDialog";
 import DependencyDialog from "./components/DependencyDialog";
+import ErrorBoundary from "./components/ErrorBoundary";
+import NetworkSimDialog from "./components/NetworkSimDialog";
+import BlockListDialog from "./components/BlockListDialog";
+import MapRulesDialog from "./components/MapRulesDialog";
 import type { HttpSession } from "./types";
+import { DEFAULT_INTERCEPT, type InterceptConfig } from "./lib/intercept";
 
 function matchesContentFilter(s: HttpSession, filter: ContentFilter): boolean {
   if (filter === "All") return true;
@@ -90,6 +96,9 @@ export default function App() {
   const [textFilter, setTextFilter] = useState("");
   const [debouncedFilter, setDebouncedFilter] = useState("");
   const [contentFilter, setContentFilter] = useState<ContentFilter>("All");
+  const [statusClasses, setStatusClasses] = useState<Set<StatusClass>>(
+    new Set(),
+  );
   const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
   const [showPinnedOnly, setShowPinnedOnly] = useState(false);
   const [pinnedIds, setPinnedIds] = useState<Set<number>>(new Set());
@@ -99,6 +108,15 @@ export default function App() {
     const id = setTimeout(() => setDebouncedFilter(textFilter), 150);
     return () => clearTimeout(id);
   }, [textFilter]);
+
+  const handleToggleStatus = useCallback((cls: StatusClass) => {
+    setStatusClasses((prev) => {
+      const next = new Set(prev);
+      if (next.has(cls)) next.delete(cls);
+      else next.add(cls);
+      return next;
+    });
+  }, []);
 
   const handleTogglePin = useCallback((id: number) => {
     setPinnedIds((prev) => {
@@ -110,7 +128,29 @@ export default function App() {
   }, []);
   const [recording, setRecording] = useState(true);
   const [prefsOpen, setPrefsOpen] = useState(false);
+  const [networkOpen, setNetworkOpen] = useState(false);
+  const [blockOpen, setBlockOpen] = useState(false);
+  const [mapOpen, setMapOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
+
+  // Interception rules (No-Cache, block/allow, map, throttle) — single source
+  // of truth, mirrored to the backend on every change.
+  const [intercept, setIntercept] =
+    useState<InterceptConfig>(DEFAULT_INTERCEPT);
+  useEffect(() => {
+    invoke<InterceptConfig>("get_intercept_config")
+      .then((c) => setIntercept({ ...DEFAULT_INTERCEPT, ...c }))
+      .catch(() => {});
+  }, []);
+  const updateIntercept = useCallback((patch: Partial<InterceptConfig>) => {
+    setIntercept((prev) => {
+      const next = { ...prev, ...patch };
+      invoke("set_intercept_config", { config: next }).catch((e) =>
+        console.error("set_intercept_config failed", e),
+      );
+      return next;
+    });
+  }, []);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [proxyPort, setProxyPort] = useState(8080);
   const [showCaDialog, setShowCaDialog] = useState(false);
@@ -158,8 +198,11 @@ export default function App() {
         defaultPath: "packetsniffer-session.json",
       });
       if (filePath) {
+        // Bodies live server-side, so pull the full sessions (with bodies)
+        // rather than the slim copies held in the UI.
+        const fullSessions = await invoke<HttpSession[]>("export_all_sessions");
         const dataToExport = {
-          sessions: Array.from(sessions.values()),
+          sessions: fullSessions,
           wsMessages: Array.from(wsMessages.entries()).map(([id, msgs]) => ({
             id,
             messages: msgs,
@@ -170,7 +213,7 @@ export default function App() {
     } catch (err) {
       console.error("Failed to export session:", err);
     }
-  }, [sessions, wsMessages]);
+  }, [wsMessages]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -188,6 +231,8 @@ export default function App() {
     clearSessions();
     clearWsMessages();
     setSelectedId(null);
+    // Drop the server-side store too so cleared bodies aren't retained.
+    invoke("clear_sessions").catch(() => {});
   }, [clearSessions, clearWsMessages]);
 
   const filteredOrder = useMemo(() => {
@@ -203,6 +248,13 @@ export default function App() {
 
       if (!matchesContentFilter(s, contentFilter)) return false;
 
+      if (statusClasses.size > 0) {
+        // status < 100 means pending / no response yet — never matches.
+        if (s.status < 100) return false;
+        const cls = `${Math.floor(s.status / 100)}xx` as StatusClass;
+        if (!statusClasses.has(cls)) return false;
+      }
+
       if (needle) {
         const haystack =
           `${s.method} ${s.scheme} ${s.host} ${s.path} ${s.status} ${s.contentType} ${s.url}`.toLowerCase();
@@ -216,6 +268,7 @@ export default function App() {
     sessions,
     debouncedFilter,
     contentFilter,
+    statusClasses,
     selectedDomain,
     showPinnedOnly,
     pinnedIds,
@@ -249,6 +302,13 @@ export default function App() {
         <Toolbar
           connected={connected}
           onOpenPreferences={() => setPrefsOpen(true)}
+          noCache={intercept.noCache}
+          onToggleNoCache={() =>
+            updateIntercept({ noCache: !intercept.noCache })
+          }
+          onOpenNetwork={() => setNetworkOpen(true)}
+          onOpenBlockList={() => setBlockOpen(true)}
+          onOpenMap={() => setMapOpen(true)}
           onOpenUpdate={() => setUpdateOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
           onExportSession={handleExportSession}
@@ -260,6 +320,8 @@ export default function App() {
         <ContentFilterBar
           activeFilter={contentFilter}
           onFilterChange={setContentFilter}
+          statusClasses={statusClasses}
+          onToggleStatus={handleToggleStatus}
         />
 
         <div className="flex-1 flex min-h-0" ref={panelGroupRef}>
@@ -315,10 +377,12 @@ export default function App() {
 
                 <ResizablePanel defaultSize="50%" minSize="10%">
                   <div className="h-full w-full min-w-0 overflow-hidden">
-                    <DetailPanel
-                      session={selectedSession}
-                      wsMessages={selectedWsMessages}
-                    />
+                    <ErrorBoundary key={selectedId ?? "none"}>
+                      <DetailPanel
+                        session={selectedSession}
+                        wsMessages={selectedWsMessages}
+                      />
+                    </ErrorBoundary>
                   </div>
                 </ResizablePanel>
               </ResizablePanelGroup>
@@ -345,21 +409,38 @@ export default function App() {
           onPortChange={setProxyPort}
         />
 
+        <NetworkSimDialog
+          open={networkOpen}
+          onOpenChange={setNetworkOpen}
+          config={intercept}
+          onUpdate={updateIntercept}
+        />
+
+        <BlockListDialog
+          open={blockOpen}
+          onOpenChange={setBlockOpen}
+          config={intercept}
+          onUpdate={updateIntercept}
+        />
+
+        <MapRulesDialog
+          open={mapOpen}
+          onOpenChange={setMapOpen}
+          config={intercept}
+          onUpdate={updateIntercept}
+        />
+
         <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
 
         <UpdateDialog open={updateOpen} onOpenChange={setUpdateOpen} />
 
-        <CaInstallDialog
-          open={showCaDialog}
-          onOpenChange={setShowCaDialog}
-        />
+        <CaInstallDialog open={showCaDialog} onOpenChange={setShowCaDialog} />
 
         <DependencyDialog
           open={showDepDialog}
           onOpenChange={setShowDepDialog}
           missingDeps={missingDeps}
         />
-
       </div>
     </main>
   );

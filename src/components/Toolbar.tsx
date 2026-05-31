@@ -1,4 +1,5 @@
-import { Search, X } from "lucide-react";
+import { useEffect, useRef } from "react";
+import { Search, X, Check } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -10,10 +11,16 @@ import {
   MenubarShortcut,
   MenubarTrigger,
 } from "@/components/ui/menubar";
+import WindowControls from "./WindowControls";
 
 interface ToolbarProps {
   connected: boolean;
   onOpenPreferences: () => void;
+  noCache: boolean;
+  onToggleNoCache: () => void;
+  onOpenNetwork: () => void;
+  onOpenBlockList: () => void;
+  onOpenMap: () => void;
   onOpenUpdate: () => void;
   onOpenAbout: () => void;
   onExportSession: () => void;
@@ -25,6 +32,11 @@ interface ToolbarProps {
 export default function Toolbar({
   connected: _,
   onOpenPreferences,
+  noCache,
+  onToggleNoCache,
+  onOpenNetwork,
+  onOpenBlockList,
+  onOpenMap,
   onOpenUpdate,
   onOpenAbout,
   onExportSession,
@@ -32,6 +44,21 @@ export default function Toolbar({
   textFilter,
   onTextChange,
 }: ToolbarProps) {
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // Ctrl/Cmd+F focuses the app's own filter instead of the webview's find bar.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        searchRef.current?.focus();
+        searchRef.current?.select();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   const handleQuit = async () => {
     try {
       await invoke("stop_proxy");
@@ -89,6 +116,30 @@ export default function Toolbar({
 
             <MenubarMenu>
               <MenubarTrigger className="h-7 px-2 text-xs font-medium cursor-default">
+                Tools
+              </MenubarTrigger>
+              <MenubarContent>
+                <MenubarItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    onToggleNoCache();
+                  }}
+                >
+                  No Cache
+                  {noCache && <Check className="ml-auto size-3.5" />}
+                </MenubarItem>
+                <MenubarItem onClick={onOpenNetwork}>
+                  Simulate Network...
+                </MenubarItem>
+                <MenubarItem onClick={onOpenBlockList}>
+                  Block / Allow List...
+                </MenubarItem>
+                <MenubarItem onClick={onOpenMap}>Map Requests...</MenubarItem>
+              </MenubarContent>
+            </MenubarMenu>
+
+            <MenubarMenu>
+              <MenubarTrigger className="h-7 px-2 text-xs font-medium cursor-default">
                 Help
               </MenubarTrigger>
               <MenubarContent>
@@ -117,24 +168,35 @@ export default function Toolbar({
           </Menubar>
         </div>
 
-        {/* Filter on the top right */}
-        <div className="flex items-center gap-1.5 bg-muted/50 border border-border rounded-md px-2 h-6 min-w-50 group focus-within:ring-1 focus-within:ring-ring z-10">
-          <Search className="size-3.5 text-muted-foreground group-focus-within:text-primary" />
-          <input
-            type="text"
-            value={textFilter}
-            onChange={(e) => onTextChange(e.target.value)}
-            placeholder="Filter (Ctrl + F)"
-            className="bg-transparent text-[11px] text-foreground placeholder:text-muted-foreground outline-none flex-1 min-w-0 font-medium"
-          />
-          {textFilter && (
-            <button
-              onClick={() => onTextChange("")}
-              className="text-muted-foreground hover:text-foreground text-xs leading-none shrink-0"
-            >
-              <X className="size-3.5" />
-            </button>
-          )}
+        {/* Right cluster: filter + window controls */}
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 bg-muted/50 border border-border rounded-md px-2 h-6 min-w-50 group focus-within:ring-1 focus-within:ring-ring z-10">
+            <Search className="size-3.5 text-muted-foreground group-focus-within:text-primary" />
+            <input
+              ref={searchRef}
+              type="text"
+              value={textFilter}
+              onChange={(e) => onTextChange(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  if (textFilter) onTextChange("");
+                  e.currentTarget.blur();
+                }
+              }}
+              placeholder="Filter (Ctrl + F)"
+              className="bg-transparent text-[11px] text-foreground placeholder:text-muted-foreground outline-none flex-1 min-w-0 font-medium"
+            />
+            {textFilter && (
+              <button
+                onClick={() => onTextChange("")}
+                className="text-muted-foreground hover:text-foreground text-xs leading-none shrink-0"
+              >
+                <X className="size-3.5" />
+              </button>
+            )}
+          </div>
+
+          <WindowControls onClose={handleQuit} />
         </div>
       </div>
     </div>

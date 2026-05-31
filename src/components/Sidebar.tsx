@@ -153,15 +153,15 @@ export default function Sidebar({
                           )}
                         />
 
-                        <span className="truncate flex-1 min-w-0 font-mono text-[11px] font-normal leading-none tracking-tight pt-px pr-8">
+                        <span className="truncate flex-1 min-w-0 font-mono text-[11px] font-normal leading-none tracking-tight pt-px pr-7">
                           {domain}
                         </span>
                         <span
                           className={cn(
-                            "absolute right-2 text-[10px] tabular-nums font-semibold shrink-0 opacity-0 group-hover:opacity-100 bg-background/80 px-1 rounded-sm",
+                            "absolute right-2 text-[10px] tabular-nums font-semibold shrink-0",
                             isSelected
-                              ? "opacity-100 bg-primary text-primary-foreground/80"
-                              : "text-muted-foreground bg-muted group-hover:bg-muted",
+                              ? "text-primary-foreground/80"
+                              : "text-muted-foreground",
                           )}
                         >
                           {count}

@@ -44,9 +44,8 @@ export function shortType(contentType: string): string {
   if (base === "application/protobuf" || base === "application/x-protobuf")
     return "protobuf";
   if (base.startsWith("image/")) return base.replace("image/", "img/");
-  if (base.startsWith("font/")) return base.replace("font/", "font/");
+  if (base.startsWith("font/")) return base;
   if (base.startsWith("video/")) return "video";
   if (base.startsWith("audio/")) return "audio";
   return base.replace("application/", "");
 }
-

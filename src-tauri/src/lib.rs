@@ -3,10 +3,58 @@ mod proxy;
 mod system_proxy;
 
 use proxy::engine::ProxyEngine;
+use proxy::http::HttpSession;
 use serde::Serialize;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use tokio::sync::Mutex;
+
+/// Maximum number of full sessions (with bodies) retained server-side. Older
+/// sessions are evicted to bound memory during very long capture runs. The
+/// frontend caps its own metadata map to the same value so a row that is still
+/// visible can always have its bodies fetched back.
+pub const MAX_SESSIONS: usize = 5000;
+
+/// Server-side authoritative store of full sessions (including bodies). The
+/// live event stream only carries slim metadata; bodies are fetched from here
+/// on demand via `get_session`, and the whole set is dumped via
+/// `export_all_sessions`. Bounded to `MAX_SESSIONS` with oldest-first eviction.
+#[derive(Default)]
+struct SessionStore {
+    map: HashMap<u64, HttpSession>,
+    order: VecDeque<u64>,
+}
+
+impl SessionStore {
+    fn insert(&mut self, session: HttpSession) {
+        let id = session.id;
+        if self.map.insert(id, session).is_none() {
+            self.order.push_back(id);
+            while self.order.len() > MAX_SESSIONS {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<HttpSession> {
+        self.map.get(&id).cloned()
+    }
+
+    fn all(&self) -> Vec<HttpSession> {
+        self.order
+            .iter()
+            .filter_map(|id| self.map.get(id).cloned())
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+}
 
 /// Session data sent to the frontend via Tauri events.
 #[derive(Debug, Clone, Serialize)]
@@ -27,6 +75,28 @@ pub struct WsMessageEvent {
 /// Shared proxy state accessible from Tauri commands.
 struct ProxyState {
     engine: Arc<Mutex<Option<ProxyEngine>>>,
+    sessions: Arc<StdMutex<SessionStore>>,
+}
+
+/// Build the proxy engine's session callback: store the full session (with
+/// bodies) server-side, then emit a slim copy (bodies stripped) to the UI. This
+/// keeps the high-frequency event stream small while preserving on-demand
+/// access to bodies via `get_session`.
+fn make_session_callback(
+    app: AppHandle,
+    store: Arc<StdMutex<SessionStore>>,
+) -> impl Fn(&str, HttpSession) + Send + Sync + 'static {
+    move |event_type, session| {
+        let slim = session.metadata_clone();
+        if let Ok(mut store) = store.lock() {
+            store.insert(session);
+        }
+        let event = SessionEvent {
+            event_type: event_type.to_string(),
+            session: slim,
+        };
+        let _ = app.emit("proxy-session", &event);
+    }
 }
 
 // ─── Tauri Commands ──────────────────────────────────────────────────────────
@@ -40,6 +110,42 @@ async fn get_proxy_status(state: tauri::State<'_, ProxyState>) -> Result<String,
     }
 }
 
+/// Fetch a full session (including request/response bodies) by id. Bodies are
+/// stripped from the live event stream, so the UI calls this when a row is
+/// inspected. Returns `None` if the session was evicted or never existed.
+#[tauri::command]
+fn get_session(id: u64, state: tauri::State<'_, ProxyState>) -> Option<HttpSession> {
+    state.sessions.lock().ok().and_then(|s| s.get(id))
+}
+
+/// Dump every retained session (with bodies) in capture order — used by the
+/// "export session" action, which needs the full bodies the live UI lacks.
+#[tauri::command]
+fn export_all_sessions(state: tauri::State<'_, ProxyState>) -> Vec<HttpSession> {
+    state.sessions.lock().map(|s| s.all()).unwrap_or_default()
+}
+
+/// Drop all retained sessions/bodies. Mirrors the UI "clear" action so the
+/// server-side store doesn't keep bodies for rows the user already cleared.
+#[tauri::command]
+fn clear_sessions(state: tauri::State<'_, ProxyState>) {
+    if let Ok(mut s) = state.sessions.lock() {
+        s.clear();
+    }
+}
+
+/// Read the current interception rules (No-Cache, block/allow, map, throttle).
+#[tauri::command]
+fn get_intercept_config() -> proxy::intercept::InterceptConfig {
+    proxy::intercept::get()
+}
+
+/// Replace the interception rules. Applied to all subsequent proxied requests.
+#[tauri::command]
+fn set_intercept_config(config: proxy::intercept::InterceptConfig) {
+    proxy::intercept::set(config);
+}
+
 #[tauri::command]
 async fn start_proxy(app: AppHandle, state: tauri::State<'_, ProxyState>) -> Result<u16, String> {
     let mut engine_guard = state.engine.lock().await;
@@ -47,17 +153,11 @@ async fn start_proxy(app: AppHandle, state: tauri::State<'_, ProxyState>) -> Res
         return Err("Proxy is already running".to_string());
     }
 
-    let app_handle = app.clone();
     let app_handle_ws = app.clone();
+    let store = state.sessions.clone();
 
     let mut engine = ProxyEngine::new(
-        move |event_type, session| {
-            let event = SessionEvent {
-                event_type: event_type.to_string(),
-                session,
-            };
-            let _ = app_handle.emit("proxy-session", &event);
-        },
+        make_session_callback(app.clone(), store),
         move |msg| {
             let event = WsMessageEvent { message: msg };
             let _ = app_handle_ws.emit("ws-message", &event);
@@ -107,17 +207,11 @@ async fn set_proxy_port(
         let _ = system_proxy::disable();
     }
 
-    let app_handle = app.clone();
     let app_handle_ws = app.clone();
+    let store = state.sessions.clone();
 
     let mut engine = ProxyEngine::new(
-        move |event_type, session| {
-            let event = SessionEvent {
-                event_type: event_type.to_string(),
-                session,
-            };
-            let _ = app_handle.emit("proxy-session", &event);
-        },
+        make_session_callback(app.clone(), store),
         move |msg| {
             let event = WsMessageEvent { message: msg };
             let _ = app_handle_ws.emit("ws-message", &event);
@@ -229,9 +323,15 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(ProxyState {
             engine: Arc::new(Mutex::new(None)),
+            sessions: Arc::new(StdMutex::new(SessionStore::default())),
         })
         .invoke_handler(tauri::generate_handler![
             get_proxy_status,
+            get_session,
+            export_all_sessions,
+            clear_sessions,
+            get_intercept_config,
+            set_intercept_config,
             start_proxy,
             stop_proxy,
             fix_proxy,
@@ -267,16 +367,10 @@ pub fn run() {
                     }
                 }
 
-                let app_handle = handle.clone();
                 let app_handle_ws = handle.clone();
+                let store = state.sessions.clone();
                 let mut engine = ProxyEngine::new(
-                    move |event_type, session| {
-                        let event = SessionEvent {
-                            event_type: event_type.to_string(),
-                            session,
-                        };
-                        let _ = app_handle.emit("proxy-session", &event);
-                    },
+                    make_session_callback(handle.clone(), store),
                     move |msg| {
                         let event = WsMessageEvent { message: msg };
                         let _ = app_handle_ws.emit("ws-message", &event);

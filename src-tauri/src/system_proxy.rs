@@ -11,6 +11,14 @@ use std::sync::Mutex;
 /// Saved proxy state so we can restore on exit.
 static ORIGINAL_STATE: Mutex<Option<OriginalProxyState>> = Mutex::new(None);
 
+/// Whether *we* successfully changed the WinHTTP proxy. `netsh winhttp set/reset
+/// proxy` needs elevation; when unelevated the set silently fails and WinHTTP is
+/// left untouched — so we must NOT try to reset it on exit (that also fails and
+/// logs a misleading warning). Only restore/reset what we actually changed.
+#[cfg(target_os = "windows")]
+static WINHTTP_CHANGED_BY_US: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Tracks which UWP loopback exemptions were added by us (not pre-existing),
 /// so `disable_uwp_loopback` only removes what we actually added.
 /// Persisted in the Windows registry at HKCU\Software\PacketSniffer\LoopbackExemptions
@@ -314,11 +322,14 @@ fn disable_windows() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     notify_windows_proxy_change();
 
-    // Restore WinHTTP proxy
-    if original.winhttp_was_set {
-        let _ = winhttp_set_proxy(&original.winhttp_proxy, &original.winhttp_bypass);
-    } else {
-        let _ = winhttp_reset();
+    // Restore WinHTTP proxy — only if we actually changed it (the set needs
+    // elevation; if it never took effect there's nothing to undo).
+    if WINHTTP_CHANGED_BY_US.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if original.winhttp_was_set {
+            let _ = winhttp_set_proxy(&original.winhttp_proxy, &original.winhttp_bypass);
+        } else {
+            let _ = winhttp_reset();
+        }
     }
 
     // Remove environment variable proxy settings (only those we set)
@@ -469,6 +480,7 @@ fn winhttp_set_proxy(
             stdout.trim()
         );
     } else {
+        WINHTTP_CHANGED_BY_US.store(true, std::sync::atomic::Ordering::SeqCst);
         log::info!("WinHTTP proxy set to {}", proxy_addr);
     }
     Ok(())
@@ -485,9 +497,11 @@ fn winhttp_reset() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .creation_flags(CREATE_NO_WINDOW)
         .output()?;
     if !output.status.success() {
+        // netsh writes the "requires elevation" message to stdout, not stderr.
         log::warn!(
-            "Failed to reset WinHTTP proxy: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "Failed to reset WinHTTP proxy: {} {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
         );
     } else {
         log::info!("WinHTTP proxy reset to direct access");
