@@ -178,32 +178,24 @@ pub async fn install_patched_apk(
             Err(e) => {
                 // The patched APK is re-signed with our debug key, so it can't
                 // update a store-signed install — Android rejects the signature
-                // mismatch. Uninstall the original and install fresh (this clears
-                // the app's existing data).
+                // mismatch. Return an error requiring confirmation rather than
+                // automatically deleting data.
                 let sig_conflict = e.contains("signatures do not match")
                     || e.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE");
-                match (sig_conflict, package.as_deref()) {
-                    (true, Some(pkg)) => {
-                        let _ = run(
-                            Command::new("adb").args(["-s", &serial, "uninstall", pkg]),
-                            "adb uninstall",
-                        );
-                        run(
-                            Command::new("adb")
-                                .args(["-s", &serial, "install", "-t"])
-                                .arg(&apk),
-                            "adb install",
-                        )
-                        .map(|_| {
-                            "Installed (replaced the original app; its data was cleared)".to_string()
-                        })
-                    }
-                    (true, None) => Err(format!(
+                if sig_conflict && package.is_some() {
+                    return Err(format!(
+                        "{e}\nThe patched app is signed differently than the one on the phone. \
+                         Installing it requires uninstalling the original app, which will erase its data. \
+                         Uninstall the app manually, then retry."
+                    ));
+                }
+                if sig_conflict && package.is_none() {
+                    return Err(format!(
                         "{e}\nThe patched app is signed differently than the one on the phone — \
                          uninstall the original app, then retry."
-                    )),
-                    _ => Err(e),
+                    ));
                 }
+                Err(e)
             }
         }
     })
@@ -547,14 +539,15 @@ pub fn device_reverse_teardown(serial: &str, port: u16) {
 }
 
 fn download_platform_tools(app: &AppHandle) -> Result<String, String> {
-    let os = if cfg!(target_os = "windows") {
-        "windows"
+    let (os, expected_sha256) = if cfg!(target_os = "windows") {
+        ("windows", "TODO_REPLACE_WITH_VERIFIED_SHA256_WINDOWS")
     } else if cfg!(target_os = "macos") {
-        "darwin"
+        ("darwin", "TODO_REPLACE_WITH_VERIFIED_SHA256_DARWIN")
     } else {
-        "linux"
+        ("linux", "TODO_REPLACE_WITH_VERIFIED_SHA256_LINUX")
     };
-    let url = format!("https://dl.google.com/android/repository/platform-tools-latest-{os}.zip");
+    // Pinned revision instead of "latest" to prevent supply-chain attacks.
+    let url = format!("https://dl.google.com/android/repository/platform-tools_r35.0.2-{os}.zip");
     let dir = data_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("create data dir: {e}"))?;
     let zip = dir.join("platform-tools.zip");
@@ -569,6 +562,15 @@ fn download_platform_tools(app: &AppHandle) -> Result<String, String> {
     curl.arg("--ssl-no-revoke");
     curl.arg("-o").arg(&zip).arg(&url);
     run(&mut curl, "download platform-tools")?;
+
+    // TODO: Verify SHA-256 before extraction. Example:
+    // let bytes = std::fs::read(&zip).map_err(|e| format!("read zip: {e}"))?;
+    // let hash = sha2::Sha256::digest(&bytes);
+    // let hex = format!("{:x}", hash);
+    // if hex != expected_sha256 {
+    //     return Err(format!("SHA-256 mismatch: expected {}, got {}", expected_sha256, hex));
+    // }
+    // Requires adding `sha2` crate to Cargo.toml.
 
     tools_progress(app, "extract", "Extracting…");
     #[cfg(target_os = "windows")]
@@ -858,19 +860,23 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
     std::fs::create_dir_all(&xml_dir).map_err(|e| format!("create res/xml: {e}"))?;
 
     let mut anchors = String::from("      <certificates src=\"system\"/>\n");
-    if opts.trust_user_store {
-        anchors.push_str("      <certificates src=\"user\"/>\n");
-    }
+    let mut trust_user_store = opts.trust_user_store;
     if opts.embed_proxy_ca {
         match copy_proxy_ca(&decode_dir) {
             Ok(()) => anchors.push_str("      <certificates src=\"@raw/proxy_ca\"/>\n"),
-            Err(e) => warnings.push(format!(
-                "Could not embed proxy CA ({e}); falling back to user store trust. \
-                 Install the CA on the device manually."
-            )),
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not embed proxy CA ({e}); falling back to user store trust. \
+                     Install the CA on the device manually."
+                ));
+                trust_user_store = true;
+            }
         }
     }
-    if !opts.embed_proxy_ca && !opts.trust_user_store {
+    if trust_user_store {
+        anchors.push_str("      <certificates src=\"user\"/>\n");
+    }
+    if !opts.embed_proxy_ca && !trust_user_store {
         warnings.push(
             "Neither embedded CA nor user-store trust selected — the app will not \
              trust the proxy. Enable one of them."
@@ -898,9 +904,9 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
         &manifest,
         "android:networkSecurityConfig",
         "@xml/network_security_config",
-    );
+    )?;
     if opts.make_debuggable {
-        patched = upsert_application_attr(&patched, "android:debuggable", "true");
+        patched = upsert_application_attr(&patched, "android:debuggable", "true")?;
     }
     std::fs::write(&manifest_path, patched).map_err(|e| format!("write manifest: {e}"))?;
 
@@ -1001,8 +1007,9 @@ fn ensure_signing_keystore() -> Result<(PathBuf, String), String> {
 // ─── XML manifest editing (no external XML dep) ───────────────────────────────
 
 /// Set `attr="value"` on the `<application>` tag, replacing an existing value if
-/// the attribute is already present.
-fn upsert_application_attr(manifest: &str, attr: &str, value: &str) -> String {
+/// the attribute is already present. Returns an error if the manifest has no
+/// editable application tag (e.g., self-closing or malformed).
+fn upsert_application_attr(manifest: &str, attr: &str, value: &str) -> Result<String, String> {
     let needle = format!("{attr}=\"");
     if let Some(start) = manifest.find(&needle) {
         let val_start = start + needle.len();
@@ -1012,7 +1019,7 @@ fn upsert_application_attr(manifest: &str, attr: &str, value: &str) -> String {
             s.push_str(&manifest[..val_start]);
             s.push_str(value);
             s.push_str(&manifest[val_end..]);
-            return s;
+            return Ok(s);
         }
     }
     // Insert into the opening <application ...> tag.
@@ -1025,10 +1032,10 @@ fn upsert_application_attr(manifest: &str, attr: &str, value: &str) -> String {
             s.push_str(&manifest[..gt]);
             s.push_str(&insert);
             s.push_str(&manifest[gt..]);
-            return s;
+            return Ok(s);
         }
     }
-    manifest.to_string()
+    Err("Manifest has no editable <application> tag (self-closing or malformed)".to_string())
 }
 
 // ─── Frida gadget injection ───────────────────────────────────────────────────
@@ -1047,6 +1054,7 @@ fn inject_frida(decode_dir: &Path, gadget_path: &str, abi_pref: &str) -> Result<
 
     // 1. Choose ABI dir. Prefer an explicit choice, else an ABI already present,
     //    preferring arm64-v8a (most modern devices).
+    const KNOWN_ABIS: &[&str] = &["armeabi-v7a", "arm64-v8a", "x86", "x86_64"];
     let lib_root = decode_dir.join("lib");
     let present: Vec<String> = std::fs::read_dir(&lib_root)
         .map(|rd| {
@@ -1058,10 +1066,18 @@ fn inject_frida(decode_dir: &Path, gadget_path: &str, abi_pref: &str) -> Result<
         .unwrap_or_default();
 
     let abi = if !abi_pref.is_empty() && abi_pref != "auto" {
+        // Validate against known ABIs to prevent path traversal
+        if !KNOWN_ABIS.contains(&abi_pref.as_str()) {
+            return Err(format!(
+                "Invalid ABI '{}'. Must be one of: {}",
+                abi_pref,
+                KNOWN_ABIS.join(", ")
+            ));
+        }
         abi_pref.to_string()
     } else if present.iter().any(|a| a == "arm64-v8a") {
         "arm64-v8a".to_string()
-    } else if let Some(first) = present.first() {
+    } else if let Some(first) = present.iter().find(|a| KNOWN_ABIS.contains(&a.as_str())) {
         first.clone()
     } else {
         notes.push("APK has no native lib dir — created lib/arm64-v8a; ensure your gadget is arm64.".to_string());
@@ -1294,6 +1310,15 @@ fn tool(bin: &str) -> Command {
 /// Run a command, returning stdout on success or a stderr-derived error.
 /// All arguments are passed as an argv array (no shell), so device serials and
 /// package names cannot inject extra commands.
+///
+/// TODO: Add timeout support using tokio::time::timeout to prevent indefinite hangs.
+/// Example implementation:
+/// ```ignore
+/// use tokio::time::{timeout, Duration};
+/// let result = timeout(Duration::from_secs(60), async {
+///     tokio::task::spawn_blocking(move || cmd.output()).await
+/// }).await;
+/// ```
 fn run(cmd: &mut Command, ctx: &str) -> Result<String, String> {
     let out = cmd
         .output()

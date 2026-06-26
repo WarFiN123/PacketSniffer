@@ -132,14 +132,19 @@ export default function App() {
 
   const handleRemoveDevice = useCallback(
     (serial: string) => {
-      setDevices((prev) => {
-        const gone = prev.find((d) => d.serial === serial);
-        if (gone && gone.ip === sourceFilter) handleSelectSource(LOCAL_SOURCE);
-        invoke("stop_device_capture", { serial }).catch(() => {});
-        return prev.filter((d) => d.serial !== serial);
-      });
+      // Derive removed device info before state update
+      const removed = devices.find((d) => d.serial === serial);
+
+      // Update state
+      setDevices((prev) => prev.filter((d) => d.serial !== serial));
+
+      // Perform side effects outside updater
+      if (removed && removed.ip === sourceFilter) {
+        handleSelectSource(LOCAL_SOURCE);
+      }
+      invoke("stop_device_capture", { serial }).catch(() => {});
     },
-    [sourceFilter, handleSelectSource],
+    [devices, sourceFilter, handleSelectSource],
   );
 
   // Debounce text filter to avoid re-filtering on every keystroke

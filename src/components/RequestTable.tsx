@@ -201,7 +201,7 @@ const RequestRow = memo(function RequestRow({
 
           {/* Size */}
           <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums text-right whitespace-nowrap">
-            {s.responseSize ? (
+            {s.responseSize != null ? (
               formatSize(s.responseSize)
             ) : !s.complete ? (
               <div className="flex items-center justify-end opacity-40 h-full">
@@ -214,7 +214,7 @@ const RequestRow = memo(function RequestRow({
 
           {/* Duration */}
           <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums text-right whitespace-nowrap">
-            {s.duration ? (
+            {s.duration != null ? (
               formatTime(s.duration)
             ) : !s.complete ? (
               <div className="flex items-center justify-end opacity-40 h-full">

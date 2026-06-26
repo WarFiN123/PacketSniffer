@@ -126,6 +126,7 @@ export default function AddDeviceDialog({
     setSerial("");
     setPkg("");
     setQuery("");
+    setPatchApp(false);
     setDevice(null);
     setLiveCount(0);
     setConnectErr("");
@@ -234,6 +235,7 @@ export default function AddDeviceDialog({
     if (!serial) return;
     setConnecting(true);
     setConnectErr("");
+    let captureStarted = false;
     try {
       setStage("Identifying the phone…");
       let ip = "";
@@ -248,6 +250,7 @@ export default function AddDeviceDialog({
       // firewall or Wi-Fi to fight, and a dedicated listener tags its traffic.
       setStage("Linking the phone over USB…");
       await invoke("start_device_capture", { serial, tag });
+      captureStarted = true;
 
       if (pkg && patchApp) {
         setStage("Unpacking the app…");
@@ -282,6 +285,10 @@ export default function AddDeviceDialog({
       setPhase("live");
     } catch (e) {
       setConnectErr(String(e));
+      // Clean up capture if it was started but subsequent steps failed
+      if (captureStarted) {
+        invoke("stop_device_capture", { serial }).catch(() => {});
+      }
     } finally {
       setConnecting(false);
     }

@@ -71,7 +71,7 @@ interface StageDef {
 
 export default function PatchApkDialog({ open, onOpenChange }: Props) {
   // ── Tooling ────────────────────────────────────────────────────────────
-  const [missingTools, setMissingTools] = useState<string[]>([]);
+  const [missingTools, setMissingTools] = useState<string[] | null>(null); // null = checking
 
   // ── Source ─────────────────────────────────────────────────────────────
   const [source, setSource] = useState<Source>("file");
@@ -121,7 +121,10 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
   // ── Effects ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!open) return;
-    invoke<string[]>("check_apk_tools").then(setMissingTools).catch(() => {});
+    setMissingTools(null); // Start in checking state
+    invoke<string[]>("check_apk_tools")
+      .then(setMissingTools)
+      .catch(() => setMissingTools([]));
     refreshDevices();
     // reset transient run state when reopened
     setRun("idle");
@@ -206,6 +209,7 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
 
   const canPatch =
     run !== "running" &&
+    missingTools !== null &&
     missingTools.length === 0 &&
     (embedCa || trustUser) &&
     (source === "file" ? apkPath !== "" : serial !== "" && pkg !== "") &&
@@ -218,13 +222,13 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
     setActiveStage(source === "device" ? "pull" : "decode");
     setInstallState("idle");
 
-    // Subscribe to progress for the rail.
-    unlistenRef.current?.();
-    unlistenRef.current = await listen<PatchProgress>("apk-patch-progress", (e) => {
-      setActiveStage(e.payload.stage);
-    });
-
     try {
+      // Subscribe to progress for the rail.
+      unlistenRef.current?.();
+      unlistenRef.current = await listen<PatchProgress>("apk-patch-progress", (e) => {
+        setActiveStage(e.payload.stage);
+      });
+
       let path = apkPath;
       if (source === "device") {
         path = await invoke<string>("pull_apk", { serial, package: pkg });
@@ -302,7 +306,7 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
           </DialogDescription>
         </DialogHeader>
 
-        {missingTools.length > 0 && (
+        {missingTools !== null && missingTools.length > 0 && (
           <div className="mx-6 mt-4 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
             <TriangleAlert className="size-4 text-destructive shrink-0 mt-0.5" />
             <p className="text-[11px] text-text-1 leading-relaxed">

@@ -205,6 +205,15 @@ async fn start_device_capture(
     tag: String,
     state: tauri::State<'_, ProxyState>,
 ) -> Result<u16, String> {
+    // Prevent concurrent setup for the same serial by checking in-progress state.
+    // If another call is already setting up this device, reject this one.
+    {
+        let captures = state.device_captures.lock().unwrap();
+        if captures.contains_key(&serial) {
+            return Err(format!("Device {} capture is already in progress or active", serial));
+        }
+    }
+
     // Replace any prior capture for this device.
     let prev = state.device_captures.lock().unwrap().remove(&serial);
     if let Some((pport, ptx)) = prev {
@@ -223,20 +232,27 @@ async fn start_device_capture(
     };
 
     let s2 = serial.clone();
+    let s3 = serial.clone();
     let setup = tokio::task::spawn_blocking(move || apk::device_reverse_setup(&s2, port))
         .await
         .map_err(|e| format!("task join error: {e}"))?;
-    if let Err(e) = setup {
-        let _ = stop_tx.send(true);
-        return Err(e);
-    }
 
-    state
-        .device_captures
-        .lock()
-        .unwrap()
-        .insert(serial, (port, stop_tx));
-    Ok(port)
+    match setup {
+        Ok(()) => {
+            state
+                .device_captures
+                .lock()
+                .unwrap()
+                .insert(serial, (port, stop_tx));
+            Ok(port)
+        }
+        Err(e) => {
+            // Teardown any partial reverse setup before stopping the listener
+            let _ = tokio::task::spawn_blocking(move || apk::device_reverse_teardown(&s3, port)).await;
+            let _ = stop_tx.send(true);
+            Err(e)
+        }
+    }
 }
 
 /// Stop a device capture: restore the phone's direct internet and shut the
@@ -541,13 +557,24 @@ pub fn run() {
     // Use run_return-style callback to handle RunEvent::Exit reliably.
     // This fires even when the app is closed via Ctrl+C from the dev server,
     // window X button, or any other exit path.
-    app.run(|_app_handle, event| {
+    app.run(|app_handle, event| {
         match event {
             RunEvent::ExitRequested { .. } => {
                 // Don't prevent exit — cleanup runs in RunEvent::Exit.
             }
             RunEvent::Exit => {
-                log::info!("RunEvent::Exit — restoring system proxy");
+                log::info!("RunEvent::Exit — cleaning up device captures and restoring system proxy");
+
+                // Drain device captures to avoid stranding phones behind a dead proxy
+                if let Some(state) = app_handle.try_state::<ProxyState>() {
+                    let caps: Vec<(String, (u16, watch::Sender<bool>))> =
+                        state.device_captures.lock().unwrap().drain().collect();
+                    for (serial, (port, stop_tx)) in caps {
+                        let _ = stop_tx.send(true);
+                        apk::device_reverse_teardown(&serial, port);
+                    }
+                }
+
                 if let Err(e) = system_proxy::disable() {
                     log::error!("Failed to restore proxy on exit: {}", e);
                 } else {
