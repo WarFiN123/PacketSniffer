@@ -27,8 +27,17 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import NetworkSimDialog from "./components/NetworkSimDialog";
 import BlockListDialog from "./components/BlockListDialog";
 import MapRulesDialog from "./components/MapRulesDialog";
-import type { HttpSession } from "./types";
+import AddDeviceDialog from "./components/AddDeviceDialog";
+import PatchApkDialog from "./components/PatchApkDialog";
+import { LOCAL_SOURCE } from "./components/Sidebar";
+import type { ConnectedDevice, HttpSession } from "./types";
 import { DEFAULT_INTERCEPT, type InterceptConfig } from "./lib/intercept";
+
+/** Requests that arrived over loopback belong to "My computer"; a phone's
+ * arrive from its LAN IP. Mirrors `isLocalAddr` in Sidebar. */
+function isLocalAddr(addr?: string): boolean {
+  return !addr || addr === "::1" || addr === "localhost" || addr.startsWith("127.");
+}
 
 function matchesContentFilter(s: HttpSession, filter: ContentFilter): boolean {
   if (filter === "All") return true;
@@ -99,9 +108,65 @@ export default function App() {
   const [statusClasses, setStatusClasses] = useState<Set<StatusClass>>(
     new Set(),
   );
-  const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
+  const [selectedDomains, setSelectedDomains] = useState<Set<string>>(
+    new Set(),
+  );
   const [showPinnedOnly, setShowPinnedOnly] = useState(false);
   const [pinnedIds, setPinnedIds] = useState<Set<number>>(new Set());
+
+  // Traffic source: "My computer" (local) or a connected phone (its LAN IP).
+  const [sourceFilter, setSourceFilter] = useState<string>(LOCAL_SOURCE);
+  const [devices, setDevices] = useState<ConnectedDevice[]>([]);
+
+  const handleSelectSource = useCallback((source: string) => {
+    setSourceFilter(source);
+    setSelectedDomains(new Set());
+    setShowPinnedOnly(false);
+  }, []);
+
+  // Plain click selects a single domain (or clears it if it was the only one);
+  // Ctrl/Cmd-click toggles a domain so several show at once.
+  const handleSelectDomain = useCallback(
+    (domain: string, additive: boolean) => {
+      setShowPinnedOnly(false);
+      setSelectedDomains((prev) => {
+        if (additive) {
+          const next = new Set(prev);
+          if (next.has(domain)) next.delete(domain);
+          else next.add(domain);
+          return next;
+        }
+        if (prev.size === 1 && prev.has(domain)) return new Set();
+        return new Set([domain]);
+      });
+    },
+    [],
+  );
+
+  const handleConnected = useCallback((device: ConnectedDevice) => {
+    setDevices((prev) => {
+      const rest = prev.filter((d) => d.serial !== device.serial);
+      return [...rest, device];
+    });
+    handleSelectSource(device.ip);
+  }, [handleSelectSource]);
+
+  const handleRemoveDevice = useCallback(
+    (serial: string) => {
+      // Derive removed device info before state update
+      const removed = devices.find((d) => d.serial === serial);
+
+      // Update state
+      setDevices((prev) => prev.filter((d) => d.serial !== serial));
+
+      // Perform side effects outside updater
+      if (removed && removed.ip === sourceFilter) {
+        handleSelectSource(LOCAL_SOURCE);
+      }
+      invoke("stop_device_capture", { serial }).catch(() => {});
+    },
+    [devices, sourceFilter, handleSelectSource],
+  );
 
   // Debounce text filter to avoid re-filtering on every keystroke
   useEffect(() => {
@@ -131,6 +196,12 @@ export default function App() {
   const [networkOpen, setNetworkOpen] = useState(false);
   const [blockOpen, setBlockOpen] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
+  const [addDeviceOpen, setAddDeviceOpen] = useState(false);
+  const [patchApkOpen, setPatchApkOpen] = useState(false);
+  // When set, the patch dialog targets an installed app on this device; null
+  // means the local-file patch flow from the Tools menu.
+  const [patchApkDevice, setPatchApkDevice] =
+    useState<ConnectedDevice | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
 
   // Interception rules (No-Cache, block/allow, map, throttle) — single source
@@ -244,7 +315,15 @@ export default function App() {
       const s = sessions.get(id);
       if (!s) return false;
 
-      if (selectedDomain && s.host !== selectedDomain) return false;
+      // Source: "My computer" shows local traffic; a device shows only its IP.
+      const inSource =
+        sourceFilter === LOCAL_SOURCE
+          ? isLocalAddr(s.clientAddr)
+          : s.clientAddr === sourceFilter;
+      if (!inSource) return false;
+
+      if (selectedDomains.size > 0 && !selectedDomains.has(s.host))
+        return false;
 
       if (!matchesContentFilter(s, contentFilter)) return false;
 
@@ -269,9 +348,10 @@ export default function App() {
     debouncedFilter,
     contentFilter,
     statusClasses,
-    selectedDomain,
+    selectedDomains,
     showPinnedOnly,
     pinnedIds,
+    sourceFilter,
   ]);
 
   const panelGroupRef = useRef<HTMLDivElement>(null);
@@ -309,6 +389,10 @@ export default function App() {
           onOpenNetwork={() => setNetworkOpen(true)}
           onOpenBlockList={() => setBlockOpen(true)}
           onOpenMap={() => setMapOpen(true)}
+          onOpenPatchApk={() => {
+            setPatchApkDevice(null);
+            setPatchApkOpen(true);
+          }}
           onOpenUpdate={() => setUpdateOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
           onExportSession={handleExportSession}
@@ -334,16 +418,22 @@ export default function App() {
               <Sidebar
                 sessions={sessions}
                 order={order}
-                selectedDomain={selectedDomain}
-                onSelectDomain={(d) => {
-                  setShowPinnedOnly(false);
-                  setSelectedDomain(d);
+                devices={devices}
+                sourceFilter={sourceFilter}
+                onSelectSource={handleSelectSource}
+                onAddDevice={() => setAddDeviceOpen(true)}
+                onRemoveDevice={handleRemoveDevice}
+                onPatchDevice={(d) => {
+                  setPatchApkDevice(d);
+                  setPatchApkOpen(true);
                 }}
+                selectedDomains={selectedDomains}
+                onSelectDomain={handleSelectDomain}
                 showPinnedOnly={showPinnedOnly}
                 onTogglePinned={() => {
                   const next = !showPinnedOnly;
                   setShowPinnedOnly(next);
-                  if (next) setSelectedDomain(null);
+                  if (next) setSelectedDomains(new Set());
                 }}
                 pinnedCount={pinnedIds.size}
               />
@@ -428,6 +518,18 @@ export default function App() {
           onOpenChange={setMapOpen}
           config={intercept}
           onUpdate={updateIntercept}
+        />
+
+        <AddDeviceDialog
+          open={addDeviceOpen}
+          onOpenChange={setAddDeviceOpen}
+          onConnected={handleConnected}
+        />
+
+        <PatchApkDialog
+          open={patchApkOpen}
+          onOpenChange={setPatchApkOpen}
+          device={patchApkDevice}
         />
 
         <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />

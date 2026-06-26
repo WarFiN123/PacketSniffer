@@ -1,3 +1,4 @@
+mod apk;
 mod cert_store;
 mod proxy;
 mod system_proxy;
@@ -8,7 +9,7 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 /// Maximum number of full sessions (with bodies) retained server-side. Older
 /// sessions are evicted to bound memory during very long capture runs. The
@@ -76,6 +77,8 @@ pub struct WsMessageEvent {
 struct ProxyState {
     engine: Arc<Mutex<Option<ProxyEngine>>>,
     sessions: Arc<StdMutex<SessionStore>>,
+    /// Per-device USB capture listeners: serial → (loopback port, stop handle).
+    device_captures: Arc<StdMutex<HashMap<String, (u16, watch::Sender<bool>)>>>,
 }
 
 /// Build the proxy engine's session callback: store the full session (with
@@ -175,12 +178,86 @@ async fn start_proxy(app: AppHandle, state: tauri::State<'_, ProxyState>) -> Res
 
 #[tauri::command]
 async fn stop_proxy(state: tauri::State<'_, ProxyState>) -> Result<(), String> {
+    // Tear down any device captures first so phones don't get stranded behind a
+    // dead proxy (clears their proxy + removes the reverse tunnel).
+    let caps: Vec<(String, (u16, watch::Sender<bool>))> =
+        state.device_captures.lock().unwrap().drain().collect();
+    for (serial, (port, stop_tx)) in caps {
+        let _ = stop_tx.send(true);
+        let _ = tokio::task::spawn_blocking(move || apk::device_reverse_teardown(&serial, port)).await;
+    }
+
     let mut engine_guard = state.engine.lock().await;
     if let Some(engine) = engine_guard.take() {
         engine.stop().await;
     }
     // Always attempt to disable the system proxy when stopping
     system_proxy::disable().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Start capturing a USB-connected device's traffic: spin up a loopback listener
+/// tagged with `tag`, tunnel the phone to it via `adb reverse`, and point the
+/// phone's proxy at it. Returns the loopback port in use.
+#[tauri::command]
+async fn start_device_capture(
+    serial: String,
+    tag: String,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<u16, String> {
+    // Replace any prior capture for this device.
+    let prev = state.device_captures.lock().unwrap().remove(&serial);
+    if let Some((pport, ptx)) = prev {
+        let _ = ptx.send(true);
+        let s = serial.clone();
+        let _ = tokio::task::spawn_blocking(move || apk::device_reverse_teardown(&s, pport)).await;
+    }
+
+    let (port, stop_tx) = {
+        let guard = state.engine.lock().await;
+        let engine = guard.as_ref().ok_or("Proxy is not running")?;
+        engine
+            .start_tagged(Arc::from(tag.as_str()))
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    let s2 = serial.clone();
+    let s3 = serial.clone();
+    let setup = tokio::task::spawn_blocking(move || apk::device_reverse_setup(&s2, port))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?;
+
+    match setup {
+        Ok(()) => {
+            state
+                .device_captures
+                .lock()
+                .unwrap()
+                .insert(serial, (port, stop_tx));
+            Ok(port)
+        }
+        Err(e) => {
+            // Teardown any partial reverse setup before stopping the listener
+            let _ = tokio::task::spawn_blocking(move || apk::device_reverse_teardown(&s3, port)).await;
+            let _ = stop_tx.send(true);
+            Err(e)
+        }
+    }
+}
+
+/// Stop a device capture: restore the phone's direct internet and shut the
+/// dedicated listener down.
+#[tauri::command]
+async fn stop_device_capture(
+    serial: String,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<(), String> {
+    let entry = state.device_captures.lock().unwrap().remove(&serial);
+    if let Some((port, stop_tx)) = entry {
+        let _ = stop_tx.send(true);
+        let _ = tokio::task::spawn_blocking(move || apk::device_reverse_teardown(&serial, port)).await;
+    }
     Ok(())
 }
 
@@ -300,6 +377,11 @@ pub fn run() {
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
 
+    // ── Re-add adb installed in a past session to PATH ───────────────────
+    // The "Install adb" step downloads platform-tools into the app data dir and
+    // only mutates the live process PATH; on relaunch we must re-register it.
+    apk::register_bundled_tools();
+
     // ── Safety net: clean up stale proxy from a previous crash ───────────
     // If the app was killed without cleanup, the system proxy still points
     // to 127.0.0.1:8080. Detect this and disable it before we start.
@@ -324,6 +406,7 @@ pub fn run() {
         .manage(ProxyState {
             engine: Arc::new(Mutex::new(None)),
             sessions: Arc::new(StdMutex::new(SessionStore::default())),
+            device_captures: Arc::new(StdMutex::new(HashMap::new())),
         })
         .invoke_handler(tauri::generate_handler![
             get_proxy_status,
@@ -334,6 +417,8 @@ pub fn run() {
             set_intercept_config,
             start_proxy,
             stop_proxy,
+            start_device_capture,
+            stop_device_capture,
             fix_proxy,
             set_proxy_port,
             install_ca_certificate,
@@ -341,6 +426,20 @@ pub fn run() {
             check_missing_deps,
             install_dependency,
             open_in_postman,
+            apk::check_apk_tools,
+            apk::list_adb_devices,
+            apk::list_device_packages,
+            apk::pull_apk,
+            apk::patch_apk,
+            apk::install_patched_apk,
+            apk::replace_patched_apk,
+            apk::get_proxy_endpoints,
+            apk::install_android_tools,
+            apk::install_patch_tools,
+            apk::set_device_proxy,
+            apk::clear_device_proxy,
+            apk::get_device_ip,
+            apk::launch_package,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -450,13 +549,24 @@ pub fn run() {
     // Use run_return-style callback to handle RunEvent::Exit reliably.
     // This fires even when the app is closed via Ctrl+C from the dev server,
     // window X button, or any other exit path.
-    app.run(|_app_handle, event| {
+    app.run(|app_handle, event| {
         match event {
             RunEvent::ExitRequested { .. } => {
                 // Don't prevent exit — cleanup runs in RunEvent::Exit.
             }
             RunEvent::Exit => {
-                log::info!("RunEvent::Exit — restoring system proxy");
+                log::info!("RunEvent::Exit — cleaning up device captures and restoring system proxy");
+
+                // Drain device captures to avoid stranding phones behind a dead proxy
+                if let Some(state) = app_handle.try_state::<ProxyState>() {
+                    let caps: Vec<(String, (u16, watch::Sender<bool>))> =
+                        state.device_captures.lock().unwrap().drain().collect();
+                    for (serial, (port, stop_tx)) in caps {
+                        let _ = stop_tx.send(true);
+                        apk::device_reverse_teardown(&serial, port);
+                    }
+                }
+
                 if let Err(e) = system_proxy::disable() {
                     log::error!("Failed to restore proxy on exit: {}", e);
                 } else {

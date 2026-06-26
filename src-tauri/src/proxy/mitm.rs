@@ -45,6 +45,7 @@ pub async fn handle_connect<S>(
     stream: S,
     hostname: String,
     port: u16,
+    client: Arc<str>,
     ca: Arc<CertificateAuthority>,
     next_id: Arc<AtomicU64>,
     on_event: Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
@@ -53,7 +54,7 @@ pub async fn handle_connect<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     if let Err(e) = handle_connect_inner(
-        stream, &hostname, port, &ca, &next_id, &on_event, &on_ws_message,
+        stream, &hostname, port, &client, &ca, &next_id, &on_event, &on_ws_message,
     )
     .await
     {
@@ -61,10 +62,12 @@ pub async fn handle_connect<S>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connect_inner<S>(
     stream: S,
     hostname: &str,
     port: u16,
+    client: &Arc<str>,
     ca: &CertificateAuthority,
     next_id: &Arc<AtomicU64>,
     on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
@@ -90,18 +93,20 @@ where
 
     // ── 2. Serve HTTP requests from the client ──────────────────────────
     if is_h2 {
-        serve_h2(tls_stream, hostname, port, next_id, on_event, on_ws_message).await
+        serve_h2(tls_stream, hostname, port, client, next_id, on_event, on_ws_message).await
     } else {
-        serve_h1(tls_stream, hostname, port, next_id, on_event, on_ws_message).await
+        serve_h1(tls_stream, hostname, port, client, next_id, on_event, on_ws_message).await
     }
 }
 
 // ─── HTTP/1.1 server on MITM'd TLS stream ──────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_h1<IO>(
     tls_stream: tokio_rustls::server::TlsStream<IO>,
     hostname: &str,
     port: u16,
+    client: &Arc<str>,
     next_id: &Arc<AtomicU64>,
     on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
     on_ws_message: &Arc<dyn Fn(WsMessage) + Send + Sync>,
@@ -111,6 +116,7 @@ where
 {
     let io = TokioIo::new(tls_stream);
     let hostname = Arc::new(hostname.to_string());
+    let client = Arc::clone(client);
     let next_id = Arc::clone(next_id);
     let on_event = Arc::clone(on_event);
     let on_ws_message = Arc::clone(on_ws_message);
@@ -122,11 +128,12 @@ where
             io,
             service_fn(move |req: Request<Incoming>| {
                 let hostname = Arc::clone(&hostname);
+                let client = Arc::clone(&client);
                 let next_id = Arc::clone(&next_id);
                 let on_event = Arc::clone(&on_event);
                 let on_ws_message = Arc::clone(&on_ws_message);
                 async move {
-                    handle_mitm_request(req, &hostname, port, &next_id, &on_event, &on_ws_message).await
+                    handle_mitm_request(req, &hostname, port, &client, &next_id, &on_event, &on_ws_message).await
                 }
             }),
         )
@@ -138,10 +145,12 @@ where
 
 // ─── HTTP/2 server on MITM'd TLS stream ────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_h2<IO>(
     tls_stream: tokio_rustls::server::TlsStream<IO>,
     hostname: &str,
     port: u16,
+    client: &Arc<str>,
     next_id: &Arc<AtomicU64>,
     on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
     _on_ws_message: &Arc<dyn Fn(WsMessage) + Send + Sync>,
@@ -151,6 +160,7 @@ where
 {
     let io = TokioIo::new(tls_stream);
     let hostname = Arc::new(hostname.to_string());
+    let client = Arc::clone(client);
     let next_id = Arc::clone(next_id);
     let on_event = Arc::clone(on_event);
 
@@ -159,10 +169,11 @@ where
             io,
             service_fn(move |req: Request<Incoming>| {
                 let hostname = Arc::clone(&hostname);
+                let client = Arc::clone(&client);
                 let next_id = Arc::clone(&next_id);
                 let on_event = Arc::clone(&on_event);
                 async move {
-                    handle_mitm_h2_request(req, &hostname, port, &next_id, &on_event).await
+                    handle_mitm_h2_request(req, &hostname, port, &client, &next_id, &on_event).await
                 }
             }),
         )
@@ -173,10 +184,12 @@ where
 
 // ─── Request handler (HTTP/1.1 client-facing) ──────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_mitm_request(
     req: Request<Incoming>,
     hostname: &str,
     port: u16,
+    client: &Arc<str>,
     next_id: &Arc<AtomicU64>,
     on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
     on_ws_message: &Arc<dyn Fn(WsMessage) + Send + Sync>,
@@ -184,9 +197,9 @@ async fn handle_mitm_request(
     let is_ws = http::is_websocket_upgrade(req.headers());
 
     if is_ws {
-        handle_mitm_ws(req, hostname, port, next_id, on_event, on_ws_message).await
+        handle_mitm_ws(req, hostname, port, client, next_id, on_event, on_ws_message).await
     } else {
-        handle_mitm_normal(req, hostname, port, next_id, on_event).await
+        handle_mitm_normal(req, hostname, port, client, next_id, on_event).await
     }
 }
 
@@ -196,6 +209,7 @@ async fn handle_mitm_normal(
     req: Request<Incoming>,
     hostname: &str,
     port: u16,
+    client: &Arc<str>,
     next_id: &Arc<AtomicU64>,
     on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
@@ -223,7 +237,7 @@ async fn handle_mitm_normal(
     let req_body_for_session = if req_body.is_empty() { None } else { Some(req_body.to_vec()) };
 
     let session = HttpSession::new_request(
-        session_id, "https", &method, &host, &path, &path,
+        session_id, client, "https", &method, &host, &path, &path,
         http::version_str(version), req_headers_ui,
         req_body.len(), req_body_for_session,
     );
@@ -286,6 +300,7 @@ async fn handle_mitm_h2_request(
     req: Request<Incoming>,
     hostname: &str,
     port: u16,
+    client: &Arc<str>,
     next_id: &Arc<AtomicU64>,
     on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
@@ -316,7 +331,7 @@ async fn handle_mitm_h2_request(
     let req_body_for_session = if req_body.is_empty() { None } else { Some(req_body.to_vec()) };
 
     let session = HttpSession::new_request(
-        session_id, "https", &method, &host, &path, &path,
+        session_id, client, "https", &method, &host, &path, &path,
         http::version_str(version), req_headers_ui,
         req_body.len(), req_body_for_session,
     );
@@ -372,10 +387,12 @@ async fn handle_mitm_h2_request(
 
 // ─── WebSocket upgrade over MITM (wss://) ──────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_mitm_ws(
     req: Request<Incoming>,
     hostname: &str,
     port: u16,
+    client: &Arc<str>,
     next_id: &Arc<AtomicU64>,
     on_event: &Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
     on_ws_message: &Arc<dyn Fn(WsMessage) + Send + Sync>,
@@ -402,7 +419,7 @@ async fn handle_mitm_ws(
     let upgrade_fut = hyper::upgrade::on(req);
 
     let mut session = HttpSession::new_request(
-        session_id, "wss", &method, &host, &path, &path,
+        session_id, client, "wss", &method, &host, &path, &path,
         http::version_str(version), req_headers.clone(), 0, None,
     );
     on_event("start", session.clone());
