@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { cn } from "@/lib/utils";
-import { Globe, Pin, Monitor, Smartphone, Apple, Plus } from "lucide-react";
+import { Globe, Pin, Monitor, Smartphone, Apple, Plus, Boxes } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ConnectedDevice, HttpSession } from "@/types";
 import {
@@ -36,8 +36,9 @@ interface SidebarProps {
   onSelectSource: (source: string) => void;
   onAddDevice: () => void;
   onRemoveDevice: (serial: string) => void;
-  selectedDomain: string | null;
-  onSelectDomain: (domain: string | null) => void;
+  onPatchDevice: (device: ConnectedDevice) => void;
+  selectedDomains: Set<string>;
+  onSelectDomain: (domain: string, additive: boolean) => void;
   showPinnedOnly: boolean;
   onTogglePinned: () => void;
   pinnedCount: number;
@@ -51,7 +52,8 @@ export default function Sidebar({
   onSelectSource,
   onAddDevice,
   onRemoveDevice,
-  selectedDomain,
+  onPatchDevice,
+  selectedDomains,
   onSelectDomain,
   showPinnedOnly,
   onTogglePinned,
@@ -151,7 +153,7 @@ export default function Sidebar({
             {sourceFilter === LOCAL_SOURCE && (
               <DomainTree
                 domains={domains}
-                selectedDomain={selectedDomain}
+                selectedDomains={selectedDomains}
                 onSelectDomain={onSelectDomain}
                 onCopy={handleCopy}
               />
@@ -179,6 +181,12 @@ export default function Sidebar({
                       <ContextMenuItem onClick={() => handleCopy(d.ip)}>
                         Copy IP ({d.ip})
                       </ContextMenuItem>
+                      <ContextMenuItem
+                        onClick={() => onPatchDevice(d)}
+                        className="gap-2"
+                      >
+                        <Boxes className="size-3.5" /> Patch APK…
+                      </ContextMenuItem>
                       <ContextMenuItem onClick={() => onRemoveDevice(d.serial)}>
                         Disconnect device
                       </ContextMenuItem>
@@ -187,7 +195,7 @@ export default function Sidebar({
                   {selected && (
                     <DomainTree
                       domains={domains}
-                      selectedDomain={selectedDomain}
+                      selectedDomains={selectedDomains}
                       onSelectDomain={onSelectDomain}
                       onCopy={handleCopy}
                     />
@@ -277,13 +285,13 @@ function SourceRow({
 
 function DomainTree({
   domains,
-  selectedDomain,
+  selectedDomains,
   onSelectDomain,
   onCopy,
 }: {
   domains: [string, number][];
-  selectedDomain: string | null;
-  onSelectDomain: (domain: string | null) => void;
+  selectedDomains: Set<string>;
+  onSelectDomain: (domain: string, additive: boolean) => void;
   onCopy: (text: string) => void;
 }) {
   if (domains.length === 0) {
@@ -295,17 +303,18 @@ function DomainTree({
   }
 
   // Domains sit directly under the source. Clicking one filters the table;
-  // clicking it again (or the source row) clears the filter — the list stays
-  // open either way.
+  // clicking it again (or the source row) clears the filter. Ctrl/Cmd-click adds
+  // or removes a domain so several can be viewed at once. The list stays open
+  // either way.
   return (
     <div className="pl-6 pr-0.5 pt-0.5 pb-1 space-y-0.5 min-w-0">
       {domains.map(([domain, count]) => {
-        const isSelected = selectedDomain === domain;
+        const isSelected = selectedDomains.has(domain);
         return (
           <ContextMenu key={domain}>
             <ContextMenuTrigger asChild>
               <button
-                onClick={() => onSelectDomain(isSelected ? null : domain)}
+                onClick={(e) => onSelectDomain(domain, e.ctrlKey || e.metaKey)}
                 className={cn(
                   "flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left group min-w-0 overflow-hidden relative",
                   isSelected

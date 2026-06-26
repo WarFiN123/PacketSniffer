@@ -205,15 +205,6 @@ async fn start_device_capture(
     tag: String,
     state: tauri::State<'_, ProxyState>,
 ) -> Result<u16, String> {
-    // Prevent concurrent setup for the same serial by checking in-progress state.
-    // If another call is already setting up this device, reject this one.
-    {
-        let captures = state.device_captures.lock().unwrap();
-        if captures.contains_key(&serial) {
-            return Err(format!("Device {} capture is already in progress or active", serial));
-        }
-    }
-
     // Replace any prior capture for this device.
     let prev = state.device_captures.lock().unwrap().remove(&serial);
     if let Some((pport, ptx)) = prev {
@@ -441,6 +432,7 @@ pub fn run() {
             apk::pull_apk,
             apk::patch_apk,
             apk::install_patched_apk,
+            apk::replace_patched_apk,
             apk::get_proxy_endpoints,
             apk::install_android_tools,
             apk::install_patch_tools,

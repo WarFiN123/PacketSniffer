@@ -9,10 +9,15 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import Switch from "./Switch";
 import Spinner from "./Spinner";
+import PatchOptions, {
+  type PatchOpts,
+  DEFAULT_PATCH_OPTS,
+  backendPatchOpts,
+  patchOptsValid,
+} from "./PatchOptions";
 import type { ConnectedDevice, SessionEvent } from "@/types";
 import {
   Monitor,
@@ -95,6 +100,7 @@ export default function AddDeviceDialog({
   const [query, setQuery] = useState("");
   const [pkgLoading, setPkgLoading] = useState(false);
   const [patchApp, setPatchApp] = useState(false);
+  const [patchOpts, setPatchOpts] = useState<PatchOpts>(DEFAULT_PATCH_OPTS);
   const [connecting, setConnecting] = useState(false);
   const [stage, setStage] = useState("");
   const [connectErr, setConnectErr] = useState("");
@@ -102,12 +108,21 @@ export default function AddDeviceDialog({
   // Live
   const [device, setDevice] = useState<ConnectedDevice | null>(null);
   const [liveCount, setLiveCount] = useState(0);
+  const [dataWiped, setDataWiped] = useState(false);
+  // Set when an install hit a signature clash mid-onboarding: the patched APK
+  // path + device tag are stashed so a user-confirmed replace can resume the flow.
+  const [pendingReplace, setPendingReplace] = useState<{
+    apkPath: string;
+    tag: string;
+  } | null>(null);
 
   const busy = installing || installingPatch || connecting;
   const adbMissing = (missing ?? []).includes("adb");
   const patchToolsMissing = (missing ?? []).filter((t) => t !== "adb");
   const canPatch = missing !== null && patchToolsMissing.length === 0;
-  const authDevice = devices.find((d) => d.serial === serial && d.state === "device");
+  const authDevice = devices.find(
+    (d) => d.serial === serial && d.state === "device",
+  );
   const pendingDevice = devices.find(
     (d) => d.serial === serial && d.state !== "device",
   );
@@ -127,11 +142,16 @@ export default function AddDeviceDialog({
     setPkg("");
     setQuery("");
     setPatchApp(false);
+    setPatchOpts(DEFAULT_PATCH_OPTS);
     setDevice(null);
     setLiveCount(0);
+    setDataWiped(false);
+    setPendingReplace(null);
     setConnectErr("");
     setStage("");
-    invoke<string[]>("check_apk_tools").then(setMissing).catch(() => setMissing([]));
+    invoke<string[]>("check_apk_tools")
+      .then(setMissing)
+      .catch(() => setMissing([]));
   }, [open]);
 
   // ── Poll for devices while the user is plugging in ─────────────────────
@@ -146,7 +166,9 @@ export default function AddDeviceDialog({
         setSerial((prev) =>
           prev && ds.some((d) => d.serial === prev)
             ? prev
-            : ds.find((d) => d.state === "device")?.serial ?? ds[0]?.serial ?? "",
+            : (ds.find((d) => d.state === "device")?.serial ??
+              ds[0]?.serial ??
+              ""),
         );
       } catch {
         if (active) setDevices([]);
@@ -177,7 +199,10 @@ export default function AddDeviceDialog({
     if (phase !== "live" || !device) return;
     let un: UnlistenFn | undefined;
     listen<SessionEvent>("proxy-session", (e) => {
-      if (e.payload.type === "start" && e.payload.session.clientAddr === device.ip) {
+      if (
+        e.payload.type === "start" &&
+        e.payload.session.clientAddr === device.ip
+      ) {
         setLiveCount((c) => c + 1);
       }
     }).then((fn) => (un = fn));
@@ -187,8 +212,9 @@ export default function AddDeviceDialog({
   const installAdb = useCallback(async () => {
     setInstalling(true);
     setToolsMsg("");
-    const un = await listen<{ message: string }>("android-tools-progress", (e) =>
-      setToolsMsg(e.payload.message),
+    const un = await listen<{ message: string }>(
+      "android-tools-progress",
+      (e) => setToolsMsg(e.payload.message),
     );
     try {
       await invoke("install_android_tools");
@@ -204,14 +230,17 @@ export default function AddDeviceDialog({
 
   const recheck = useCallback(() => {
     setMissing(null);
-    invoke<string[]>("check_apk_tools").then(setMissing).catch(() => setMissing([]));
+    invoke<string[]>("check_apk_tools")
+      .then(setMissing)
+      .catch(() => setMissing([]));
   }, []);
 
   const installPatch = useCallback(async () => {
     setInstallingPatch(true);
     setPatchMsg("");
-    const un = await listen<{ message: string }>("android-tools-progress", (e) =>
-      setPatchMsg(e.payload.message),
+    const un = await listen<{ message: string }>(
+      "android-tools-progress",
+      (e) => setPatchMsg(e.payload.message),
     );
     try {
       const summary = await invoke<string>("install_patch_tools");
@@ -228,13 +257,38 @@ export default function AddDeviceDialog({
 
   const filteredPkgs = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return q ? packages.filter((p) => p.package.toLowerCase().includes(q)) : packages;
+    return q
+      ? packages.filter((p) => p.package.toLowerCase().includes(q))
+      : packages;
   }, [packages, query]);
+
+  // Finish onboarding: open the app (best-effort) and switch to the live view.
+  // Shared by the clean-install path and the confirmed-replace path.
+  const goLive = useCallback(
+    async (tag: string) => {
+      if (pkg) {
+        setStage("Opening the app…");
+        try {
+          await invoke("launch_package", { serial, package: pkg });
+        } catch {
+          /* launch is best-effort — the capture is already live */
+        }
+      }
+      const model = devices.find((d) => d.serial === serial)?.model || serial;
+      setDevice({ serial, model, ip: tag, platform: "android" });
+      setPhase("live");
+      setPendingReplace(null);
+      setStage("");
+      setConnecting(false);
+    },
+    [pkg, serial, devices],
+  );
 
   const startCapture = useCallback(async () => {
     if (!serial) return;
     setConnecting(true);
     setConnectErr("");
+    setPendingReplace(null);
     let captureStarted = false;
     try {
       setStage("Identifying the phone…");
@@ -257,32 +311,24 @@ export default function AddDeviceDialog({
         const path = await invoke<string>("pull_apk", { serial, package: pkg });
         setStage("Embedding the certificate…");
         const res = await invoke<PatchResult>("patch_apk", {
-          opts: {
-            apkPath: path,
-            embedProxyCa: true,
-            trustUserStore: true,
-            makeDebuggable: false,
-            injectFrida: false,
-            fridaGadgetPath: "",
-            fridaAbi: "auto",
-          },
+          opts: backendPatchOpts(path, patchOpts),
         });
         setStage("Reinstalling the app…");
-        await invoke("install_patched_apk", {
-          serial,
-          apkPath: res.outputPath,
-          package: pkg,
-        });
+        const install = await invoke<{ status: string; message: string }>(
+          "install_patched_apk",
+          { serial, apkPath: res.outputPath, package: pkg },
+        );
+        if (install.status === "needsReplace") {
+          // Replacing wipes the app's data — pause and let the user decide. The
+          // capture is already live, so we resume to "live" once they choose.
+          setPendingReplace({ apkPath: res.outputPath, tag });
+          setStage("");
+          setConnecting(false);
+          return;
+        }
       }
 
-      if (pkg) {
-        setStage("Opening the app…");
-        await invoke("launch_package", { serial, package: pkg });
-      }
-
-      const model = devices.find((d) => d.serial === serial)?.model || serial;
-      setDevice({ serial, model, ip: tag, platform: "android" });
-      setPhase("live");
+      await goLive(tag);
     } catch (e) {
       setConnectErr(String(e));
       // Clean up capture if it was started but subsequent steps failed
@@ -292,7 +338,37 @@ export default function AddDeviceDialog({
     } finally {
       setConnecting(false);
     }
-  }, [serial, pkg, patchApp, devices]);
+  }, [serial, pkg, patchApp, patchOpts, devices, goLive]);
+
+  // User accepted the data-wiping reinstall: replace the app, then resume onboarding.
+  const confirmReplace = useCallback(async () => {
+    if (!pendingReplace) return;
+    setConnecting(true);
+    setConnectErr("");
+    setStage("Replacing the app…");
+    try {
+      await invoke<string>("replace_patched_apk", {
+        serial,
+        apkPath: pendingReplace.apkPath,
+        package: pkg,
+      });
+      setDataWiped(true);
+      await goLive(pendingReplace.tag);
+    } catch (e) {
+      setConnectErr(String(e));
+      setConnecting(false);
+      setStage("");
+    }
+  }, [pendingReplace, serial, pkg, goLive]);
+
+  // User declined: go live without patching. The app keeps its data but won't
+  // trust our CA, so clear the patched marker to surface the "HTTPS is opaque" hint.
+  const skipReplace = useCallback(async () => {
+    if (!pendingReplace) return;
+    const { tag } = pendingReplace;
+    setPatchApp(false);
+    await goLive(tag);
+  }, [pendingReplace, goLive]);
 
   const finish = useCallback(() => {
     if (device) onConnected(device);
@@ -314,8 +390,8 @@ export default function AddDeviceDialog({
             <Smartphone className="size-5" /> Add an Android phone
           </DialogTitle>
           <DialogDescription className="text-text-2 text-xs">
-            Route a phone's traffic through PacketSniffer over USB, then watch its
-            requests live. For apps and devices you own.
+            Route a phone's traffic through PacketSniffer over USB, then watch
+            its requests live. For apps and devices you own.
           </DialogDescription>
         </DialogHeader>
 
@@ -366,14 +442,60 @@ export default function AddDeviceDialog({
                     onQuery={setQuery}
                     patchApp={patchApp}
                     onPatchApp={setPatchApp}
+                    patchOpts={patchOpts}
+                    onPatchOpts={(p) =>
+                      setPatchOpts((prev) => ({ ...prev, ...p }))
+                    }
                     canPatch={canPatch}
                     connecting={connecting}
                     stage={stage}
                     connectErr={connectErr}
                   />
                 )}
+                {phase === "app" && pendingReplace && (
+                  <div className="mt-4 flex items-start gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-3">
+                    <TriangleAlert className="size-4 text-yellow-500 shrink-0 mt-0.5" />
+                    <div className="space-y-2.5">
+                      <p className="text-[11px] text-text-1 leading-relaxed">
+                        <span className="font-medium">{pkg}</span> is already
+                        installed and signed differently than our patched build, so
+                        it can't be updated in place. Replacing it means
+                        uninstalling the original first —{" "}
+                        <span className="font-medium">
+                          its data on the phone will be erased.
+                        </span>{" "}
+                        Or skip patching and still capture its traffic, just without
+                        decrypting HTTPS.
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={confirmReplace}
+                          disabled={connecting}
+                        >
+                          {connecting ? <Spinner size={14} /> : null} Replace &amp;
+                          erase data
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={skipReplace}
+                          disabled={connecting}
+                        >
+                          Skip patching
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                )}
                 {phase === "live" && device && (
-                  <LiveStep device={device} count={liveCount} patched={patchApp} />
+                  <LiveStep
+                    device={device}
+                    count={liveCount}
+                    patched={patchApp}
+                    dataWiped={dataWiped}
+                  />
                 )}
               </div>
             </ScrollArea>
@@ -381,22 +503,34 @@ export default function AddDeviceDialog({
             {/* ── Footer ──────────────────────────────────────────────── */}
             <div className="border-t border-border/60 bg-bg-2/30 px-6 py-3 flex items-center justify-between gap-3">
               <div className="flex items-center gap-2">
-                {(phase === "connect" || phase === "app") && !busy && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setPhase(phase === "connect" ? "tools" : "connect")}
-                  >
-                    <ChevronLeft className="size-3.5 mr-1" /> Back
-                  </Button>
-                )}
+                {(phase === "connect" || phase === "app") &&
+                  !busy &&
+                  !pendingReplace && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() =>
+                        setPhase(phase === "connect" ? "tools" : "connect")
+                      }
+                    >
+                      <ChevronLeft className="size-3.5 mr-1" /> Back
+                    </Button>
+                  )}
               </div>
 
               <div className="flex items-center gap-2">
                 {phase === "tools" &&
                   (adbMissing ? (
-                    <Button size="sm" onClick={installAdb} disabled={installing || missing === null}>
-                      {installing ? <Spinner size={14} /> : <Download className="size-3.5 mr-1" />}
+                    <Button
+                      size="sm"
+                      onClick={installAdb}
+                      disabled={installing || missing === null}
+                    >
+                      {installing ? (
+                        <Spinner size={14} />
+                      ) : (
+                        <Download className="size-3.5 mr-1" />
+                      )}
                       {installing ? "Installing…" : "Install adb"}
                     </Button>
                   ) : (
@@ -410,13 +544,23 @@ export default function AddDeviceDialog({
                   ))}
 
                 {phase === "connect" && (
-                  <Button size="sm" onClick={() => setPhase("app")} disabled={!authDevice}>
+                  <Button
+                    size="sm"
+                    onClick={() => setPhase("app")}
+                    disabled={!authDevice}
+                  >
                     Continue
                   </Button>
                 )}
 
-                {phase === "app" && (
-                  <Button size="sm" onClick={startCapture} disabled={connecting}>
+                {phase === "app" && !pendingReplace && (
+                  <Button
+                    size="sm"
+                    onClick={startCapture}
+                    disabled={
+                      connecting || (patchApp && !patchOptsValid(patchOpts))
+                    }
+                  >
                     {connecting ? <Spinner size={14} /> : null}
                     {connecting ? "Connecting…" : "Start capturing"}
                   </Button>
@@ -451,27 +595,38 @@ function Spine({
 }) {
   return (
     <div className="relative bg-bg-0/60 spine-grain overflow-hidden px-5 py-5 flex flex-col">
-      <div className="relative flex flex-col flex-1">
+      {/* All points — computer, the four stations, phone — share one evenly
+          spaced column so the tether line threads dead-centre through every
+          icon and no gap is bigger than another. */}
+      <div className="relative flex flex-col flex-1 justify-between">
         {/* one continuous tether line: computer ↕ phone. The captured-traffic
-            packet rides it bottom→top so it's never on an invisible segment. */}
+            packet rides it bottom→top so it's never on an invisible segment.
+            It sits behind the icons (lower z-index). */}
         <span className="spine-track">
           {linkActive && (
-            <span className="packet" style={{ background: live ? LIVE : undefined }} />
+            <span
+              className="packet"
+              style={{ background: live ? LIVE : undefined }}
+            />
           )}
         </span>
 
         {/* this computer */}
-        <Endpoint icon={<Monitor className="size-3.5" />} label="This computer" active />
+        <Endpoint
+          icon={<Monitor className="size-3.5" />}
+          label="This computer"
+          active
+        />
 
-        {/* stations, spread evenly along the tether */}
-        <div className="my-3 flex-1 flex flex-col justify-between">
-          {STATIONS.map((s, i) => {
-            const status =
-              i < phaseIndex ? "done" : i === phaseIndex ? "active" : "pending";
-            return (
-              <div key={s.key} className="relative flex items-center gap-3">
+        {/* stations */}
+        {STATIONS.map((s, i) => {
+          const status =
+            i < phaseIndex ? "done" : i === phaseIndex ? "active" : "pending";
+          return (
+            <div key={s.key} className="relative flex items-center gap-3">
+              <span className="w-7 flex justify-center shrink-0">
                 <span
-                  className={`relative z-10 grid place-items-center size-6 rounded-full border shrink-0 transition-colors ${
+                  className={`relative z-10 grid place-items-center size-6 rounded-full border transition-colors ${
                     status === "done"
                       ? "border-foreground bg-foreground text-background"
                       : status === "active"
@@ -487,24 +642,26 @@ function Spine({
                     <span className="text-[9px] font-mono">{s.code}</span>
                   )}
                 </span>
-                <div className="min-w-0">
-                  <div className="text-[10px] font-mono tracking-wider text-text-2">{s.code}</div>
-                  <div
-                    className={`text-xs leading-tight ${
-                      status === "active"
-                        ? "text-text-0 font-medium"
-                        : status === "pending"
-                          ? "text-muted-foreground"
-                          : "text-text-1"
-                    }`}
-                  >
-                    {s.label}
-                  </div>
+              </span>
+              <div className="min-w-0">
+                <div className="text-[10px] font-mono tracking-wider text-text-2">
+                  {s.code}
+                </div>
+                <div
+                  className={`text-xs leading-tight ${
+                    status === "active"
+                      ? "text-text-0 font-medium"
+                      : status === "pending"
+                        ? "text-muted-foreground"
+                        : "text-text-1"
+                  }`}
+                >
+                  {s.label}
                 </div>
               </div>
-            );
-          })}
-        </div>
+            </div>
+          );
+        })}
 
         {/* the phone */}
         <Endpoint
@@ -530,14 +687,18 @@ function Endpoint({
   live?: boolean;
 }) {
   return (
-    <div className="flex items-center gap-2 min-w-0">
-      <span
-        className={`grid place-items-center size-7 rounded-md border shrink-0 ${
-          active ? "border-foreground/60 text-text-0" : "border-border text-muted-foreground"
-        }`}
-        style={live ? { borderColor: LIVE, color: LIVE } : undefined}
-      >
-        {icon}
+    <div className="flex items-center gap-3 min-w-0">
+      <span className="w-7 flex justify-center shrink-0">
+        <span
+          className={`relative z-10 grid place-items-center size-7 rounded-md border bg-bg-0 ${
+            active
+              ? "border-foreground/60 text-text-0"
+              : "border-border text-muted-foreground"
+          }`}
+          style={live ? { borderColor: LIVE, color: LIVE } : undefined}
+        >
+          {icon}
+        </span>
       </span>
       <span
         className={`text-[11px] truncate ${active ? "text-text-1" : "text-muted-foreground"}`}
@@ -614,7 +775,8 @@ function ToolchainStep({
                   <p className="text-[11px] text-text-1 leading-relaxed">
                     adb isn't on this computer. Use{" "}
                     <span className="text-text-0 font-medium">Install adb</span>{" "}
-                    below — we'll fetch Google's platform-tools, no setup needed.
+                    below — we'll fetch Google's platform-tools, no setup
+                    needed.
                   </p>
                   {installing && (
                     <p className="text-[10px] font-mono text-muted-foreground mt-1.5 break-all flex items-center gap-1.5">
@@ -633,9 +795,7 @@ function ToolchainStep({
 
           {/* Patch tools */}
           <div>
-            <SectionLabel>
-              For patching apps · optional
-            </SectionLabel>
+            <SectionLabel>For patching apps · optional</SectionLabel>
             <div className="rounded-md border border-border/60 overflow-hidden">
               {PATCH_TOOLS.map((t) => (
                 <ToolRow
@@ -665,7 +825,7 @@ function ToolchainStep({
                       <Download className="size-3.5" /> Install patch tools
                     </button>
                     {patchMsg && (
-                      <p className="text-[10px] font-mono text-text-2 leading-relaxed break-words">
+                      <p className="text-[10px] font-mono text-text-2 leading-relaxed wrap-break-word">
                         {patchMsg}
                       </p>
                     )}
@@ -693,12 +853,16 @@ function ToolRow({
     <div className="flex items-center gap-3 px-3 py-2.5 bg-bg-1 border-b border-border/40 last:border-b-0">
       <span
         className={`grid place-items-center size-5 rounded-full shrink-0 ${
-          present ? "bg-foreground text-background" : "border border-border text-muted-foreground"
+          present
+            ? "bg-foreground text-background"
+            : "border border-border text-muted-foreground"
         }`}
       >
         {present ? <Check className="size-3" /> : <X className="size-3" />}
       </span>
-      <span className="font-mono text-[12px] text-text-0 w-24 shrink-0">{name}</span>
+      <span className="font-mono text-[12px] text-text-0 w-24 shrink-0">
+        {name}
+      </span>
       <span className="text-[11px] text-muted-foreground truncate">{role}</span>
       <span
         className={`ml-auto text-[10px] font-mono uppercase tracking-wider shrink-0 ${
@@ -763,7 +927,9 @@ function ConnectStep({
             <Usb className="size-3.5 text-muted-foreground" />
           </span>
           <div className="min-w-0">
-            <div className="text-[12px] text-text-1">Waiting for your phone…</div>
+            <div className="text-[12px] text-text-1">
+              Waiting for your phone…
+            </div>
             <div className="text-[11px] text-muted-foreground">
               It'll appear here the moment it's plugged in and trusted.
             </div>
@@ -787,7 +953,9 @@ function ConnectStep({
                 }`}
               >
                 <Smartphone className="size-3.5 text-muted-foreground shrink-0" />
-                <span className="text-[12px] text-text-0 truncate">{d.model || d.serial}</span>
+                <span className="text-[12px] text-text-0 truncate">
+                  {d.model || d.serial}
+                </span>
                 <span className="ml-auto text-[10px] font-mono text-muted-foreground">
                   {d.state}
                 </span>
@@ -800,7 +968,13 @@ function ConnectStep({
   );
 }
 
-function DeviceCard({ device, state }: { device: AdbDevice; state: "ready" | "pending" }) {
+function DeviceCard({
+  device,
+  state,
+}: {
+  device: AdbDevice;
+  state: "ready" | "pending";
+}) {
   const ready = state === "ready";
   return (
     <div
@@ -812,7 +986,10 @@ function DeviceCard({ device, state }: { device: AdbDevice; state: "ready" | "pe
     >
       <span
         className="grid place-items-center size-8 rounded-md border shrink-0"
-        style={{ borderColor: ready ? `${LIVE}66` : "var(--border)", color: ready ? LIVE : undefined }}
+        style={{
+          borderColor: ready ? `${LIVE}66` : "var(--border)",
+          color: ready ? LIVE : undefined,
+        }}
       >
         <Smartphone className="size-4" />
       </span>
@@ -820,10 +997,15 @@ function DeviceCard({ device, state }: { device: AdbDevice; state: "ready" | "pe
         <div className="text-[13px] text-text-0 font-medium truncate">
           {device.model || "Android device"}
         </div>
-        <div className="text-[11px] font-mono text-muted-foreground truncate">{device.serial}</div>
+        <div className="text-[11px] font-mono text-muted-foreground truncate">
+          {device.serial}
+        </div>
       </div>
       {ready ? (
-        <span className="flex items-center gap-1.5 text-[11px] font-medium" style={{ color: LIVE }}>
+        <span
+          className="flex items-center gap-1.5 text-[11px] font-medium"
+          style={{ color: LIVE }}
+        >
           <Check className="size-3.5" /> Connected
         </span>
       ) : (
@@ -847,6 +1029,8 @@ function AppStep({
   onQuery,
   patchApp,
   onPatchApp,
+  patchOpts,
+  onPatchOpts,
   canPatch,
   connecting,
   stage,
@@ -861,6 +1045,8 @@ function AppStep({
   onQuery: (q: string) => void;
   patchApp: boolean;
   onPatchApp: (v: boolean) => void;
+  patchOpts: PatchOpts;
+  onPatchOpts: (patch: Partial<PatchOpts>) => void;
   canPatch: boolean;
   connecting: boolean;
   stage: string;
@@ -869,7 +1055,10 @@ function AppStep({
   if (connecting) {
     return (
       <div className="space-y-5">
-        <StepHeading title="Connecting…" sub="Setting the phone up to route through PacketSniffer." />
+        <StepHeading
+          title="Connecting…"
+          sub="Setting the phone up to route through PacketSniffer."
+        />
         <div className="flex items-center gap-3 rounded-md border border-border bg-bg-2/30 px-4 py-4">
           <Spinner size={16} />
           <span className="text-[12px] text-text-1">{stage}</span>
@@ -923,12 +1112,16 @@ function AppStep({
               >
                 <span
                   className={`grid place-items-center size-4 rounded-full border shrink-0 ${
-                    pkg === p.package ? "bg-foreground border-foreground text-background" : "border-border"
+                    pkg === p.package
+                      ? "bg-foreground border-foreground text-background"
+                      : "border-border"
                   }`}
                 >
                   {pkg === p.package && <Check className="size-2.5" />}
                 </span>
-                <span className="font-mono text-[12px] text-text-0 truncate">{p.package}</span>
+                <span className="font-mono text-[12px] text-text-0 truncate">
+                  {p.package}
+                </span>
               </button>
             ))
           )}
@@ -938,20 +1131,23 @@ function AppStep({
       {!pkg && (
         <p className="text-[11px] text-muted-foreground leading-relaxed">
           No app selected — PacketSniffer captures every app that respects the
-          phone's proxy (all HTTP; HTTPS where the certificate is already trusted).
-          Nothing is reinstalled.
+          phone's proxy (all HTTP; HTTPS where the certificate is already
+          trusted). Nothing is reinstalled.
         </p>
       )}
 
       {/* Advanced: patch the selected app */}
       <label
         className={`flex items-start gap-3 rounded-md border px-3 py-2.5 ${
-          patchEnabled ? "border-border/60 bg-bg-1 cursor-pointer" : "border-border/40 bg-bg-2/20"
+          patchEnabled
+            ? "border-border/60 bg-bg-1 cursor-pointer"
+            : "border-border/40 bg-bg-2/20"
         }`}
       >
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 text-sm text-text-0">
-            <ShieldCheck className="size-3.5" /> Patch this app to decrypt its HTTPS
+            <ShieldCheck className="size-3.5" /> Patch this app to decrypt its
+            HTTPS
           </div>
           <div className="text-[11px] text-muted-foreground leading-snug mt-0.5">
             {!pkg
@@ -966,6 +1162,20 @@ function AppStep({
           onChange={(v) => patchEnabled && onPatchApp(v)}
         />
       </label>
+
+      {/* Advanced patch knobs — the same set the Tools › Patch APK dialog
+          exposes, revealed once patching is on. */}
+      {patchApp && patchEnabled && (
+        <div className="space-y-2">
+          <SectionLabel>Patch options</SectionLabel>
+          <PatchOptions opts={patchOpts} onChange={onPatchOpts} />
+          {!patchOpts.embedCa && !patchOpts.trustUser && (
+            <p className="text-[11px] text-destructive">
+              Enable at least one trust anchor (embed CA or user store).
+            </p>
+          )}
+        </div>
+      )}
 
       {connectErr && (
         <div className="flex items-start gap-2 text-[11px] text-destructive">
@@ -983,16 +1193,21 @@ function LiveStep({
   device,
   count,
   patched,
+  dataWiped,
 }: {
   device: ConnectedDevice;
   count: number;
   patched: boolean;
+  dataWiped: boolean;
 }) {
   return (
     <div className="space-y-5">
       <div className="flex items-center gap-2.5">
         <span className="relative grid place-items-center size-3">
-          <span className="absolute inset-0 rounded-full live-pulse" style={{ background: LIVE }} />
+          <span
+            className="absolute inset-0 rounded-full live-pulse"
+            style={{ background: LIVE }}
+          />
           <span className="size-2 rounded-full" style={{ background: LIVE }} />
         </span>
         <span
@@ -1015,7 +1230,9 @@ function LiveStep({
       <div className="rounded-md border border-border/60 bg-bg-2/30 px-4 py-4 flex items-center gap-3">
         <Activity className="size-5 text-text-1 shrink-0" />
         <div>
-          <div className="text-2xl font-chakra tabular-nums text-text-0 leading-none">{count}</div>
+          <div className="text-2xl font-chakra tabular-nums text-text-0 leading-none">
+            {count}
+          </div>
           <div className="text-[11px] text-muted-foreground mt-1">
             request{count === 1 ? "" : "s"} captured from this phone so far
           </div>
@@ -1024,16 +1241,30 @@ function LiveStep({
 
       <p className="text-[12px] text-text-1 leading-relaxed">
         The phone now routes through PacketSniffer. Use the app and its requests
-        stream into the inspector. Open the inspector to watch them — it's filtered
-        to this device under <span className="text-text-0 font-medium">Devices</span> in
-        the sidebar.
+        stream into the inspector. Open the inspector to watch them — it's
+        filtered to this device under{" "}
+        <span className="text-text-0 font-medium">Devices</span> in the sidebar.
       </p>
+
+      {dataWiped && (
+        <div className="flex items-start gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2">
+          <TriangleAlert className="size-4 text-yellow-500 shrink-0 mt-0.5" />
+          <p className="text-[11px] text-text-1 leading-relaxed">
+            The patched app was signed differently than the version already on the
+            phone, so the original had to be uninstalled and replaced —{" "}
+            <span className="font-medium">its existing data was erased.</span>
+          </p>
+        </div>
+      )}
 
       {!patched && (
         <p className="text-[11px] text-muted-foreground leading-relaxed">
-          Seeing HTTPS lines with no detail? That app doesn't trust our certificate.
-          Re-add it and turn on{" "}
-          <span className="text-text-1">Patch this app to decrypt its HTTPS</span>.
+          Seeing HTTPS lines with no detail? That app doesn't trust our
+          certificate. Re-add it and turn on{" "}
+          <span className="text-text-1">
+            Patch this app to decrypt its HTTPS
+          </span>
+          .
         </p>
       )}
     </div>
@@ -1045,8 +1276,12 @@ function LiveStep({
 function StepHeading({ title, sub }: { title: string; sub: string }) {
   return (
     <div>
-      <h3 className="font-chakra text-text-0 text-base tracking-wide">{title}</h3>
-      <p className="text-[12px] text-muted-foreground leading-relaxed mt-1">{sub}</p>
+      <h3 className="font-chakra text-text-0 text-base tracking-wide">
+        {title}
+      </h3>
+      <p className="text-[12px] text-muted-foreground leading-relaxed mt-1">
+        {sub}
+      </p>
     </div>
   );
 }
@@ -1080,26 +1315,30 @@ const CSS = `
 }
 .station-blink { animation: stationBlink 1s steps(1) infinite; }
 @keyframes stationBlink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0.25; } }
-/* continuous tether line — computer icon centre down to phone icon centre */
+/* continuous tether line — threads the centre (x=14px) of every icon column,
+   computer icon centre down to phone icon centre. Sits behind the icons. */
 .spine-track {
   position: absolute;
-  left: 11px;
+  left: 13.5px;
   top: 14px;
   bottom: 14px;
   width: 1px;
   background: var(--border);
+  z-index: 0;
 }
-/* travelling packet: rides the track phone → computer (captured traffic in) */
+/* travelling packet: a short line segment the width of the track that rides it
+   phone → computer (captured traffic in). z-index stays below the icons (z-10)
+   so it passes behind them. */
 .packet {
   position: absolute;
-  left: -3px;
-  width: 7px;
-  height: 7px;
-  border-radius: 9999px;
+  left: 0;
+  width: 1px;
+  height: 16px;
+  border-radius: 1px;
   background: var(--foreground);
   box-shadow: 0 0 8px 1px color-mix(in oklch, var(--foreground) 60%, transparent);
   animation: packetTravel 2.4s linear infinite;
-  z-index: 20;
+  z-index: 1;
 }
 @keyframes packetTravel {
   0%   { top: 100%; opacity: 0; }

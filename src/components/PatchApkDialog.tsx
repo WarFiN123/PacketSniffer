@@ -11,7 +11,6 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -21,33 +20,32 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import Switch from "./Switch";
 import Spinner from "./Spinner";
+import PatchOptions, {
+  type PatchOpts,
+  DEFAULT_PATCH_OPTS,
+  backendPatchOpts,
+  patchOptsValid,
+} from "./PatchOptions";
 import {
   Boxes,
   Smartphone,
-  FileDown,
   FolderOpen,
   Check,
   X,
   TriangleAlert,
   RefreshCw,
   Copy,
-  Syringe,
-  ShieldCheck,
-  Cpu,
 } from "lucide-react";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  // When set, the dialog patches an app already installed on this device
+  // (pull → patch → install). When null/undefined it patches a local .apk file.
+  device?: { serial: string; model?: string } | null;
 }
 
-interface AdbDevice {
-  serial: string;
-  state: string;
-  model: string;
-}
 interface DevicePackage {
   package: string;
 }
@@ -60,7 +58,6 @@ interface PatchProgress {
   message: string;
 }
 
-type Source = "file" | "device";
 type RunState = "idle" | "running" | "done" | "error";
 
 interface StageDef {
@@ -69,28 +66,28 @@ interface StageDef {
   label: string;
 }
 
-export default function PatchApkDialog({ open, onOpenChange }: Props) {
+export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
+  // Device-bound mode pulls/installs against this serial; file mode is local.
+  const source: "file" | "device" = device ? "device" : "file";
+  const serial = device?.serial ?? "";
+
   // ── Tooling ────────────────────────────────────────────────────────────
   const [missingTools, setMissingTools] = useState<string[] | null>(null); // null = checking
 
   // ── Source ─────────────────────────────────────────────────────────────
-  const [source, setSource] = useState<Source>("file");
   const [apkPath, setApkPath] = useState("");
   const [dragOver, setDragOver] = useState(false);
 
-  const [devices, setDevices] = useState<AdbDevice[]>([]);
-  const [serial, setSerial] = useState("");
   const [packages, setPackages] = useState<DevicePackage[]>([]);
   const [pkg, setPkg] = useState("");
   const [pkgLoading, setPkgLoading] = useState(false);
 
   // ── Options ────────────────────────────────────────────────────────────
-  const [embedCa, setEmbedCa] = useState(true);
-  const [trustUser, setTrustUser] = useState(false);
-  const [debuggable, setDebuggable] = useState(false);
-  const [frida, setFrida] = useState(false);
-  const [fridaPath, setFridaPath] = useState("");
-  const [fridaAbi, setFridaAbi] = useState("auto");
+  const [opts, setOpts] = useState<PatchOpts>(DEFAULT_PATCH_OPTS);
+  const patchOpt = useCallback(
+    (patch: Partial<PatchOpts>) => setOpts((p) => ({ ...p, ...patch })),
+    [],
+  );
 
   // ── Run ────────────────────────────────────────────────────────────────
   const [run, setRun] = useState<RunState>("idle");
@@ -98,7 +95,7 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
   const [errorMsg, setErrorMsg] = useState("");
   const [result, setResult] = useState<PatchResult | null>(null);
   const [installState, setInstallState] = useState<
-    "idle" | "installing" | "done" | "error"
+    "idle" | "installing" | "confirm" | "done" | "error"
   >("idle");
   const [installMsg, setInstallMsg] = useState("");
   const unlistenRef = useRef<UnlistenFn | null>(null);
@@ -107,16 +104,17 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
   // exactly what the backend will run.
   const stages = useMemo<StageDef[]>(() => {
     const s: StageDef[] = [];
-    if (source === "device") s.push({ key: "pull", code: "00", label: "Pull from device" });
+    if (source === "device")
+      s.push({ key: "pull", code: "00", label: "Pull from device" });
     s.push({ key: "decode", code: "01", label: "Decompile" });
     s.push({ key: "inject", code: "02", label: "Security config" });
     s.push({ key: "manifest", code: "03", label: "Patch manifest" });
-    if (frida) s.push({ key: "frida", code: "04", label: "Frida gadget" });
-    s.push({ key: "build", code: frida ? "05" : "04", label: "Rebuild" });
-    s.push({ key: "align", code: frida ? "06" : "05", label: "Zipalign" });
-    s.push({ key: "sign", code: frida ? "07" : "06", label: "Sign" });
+    if (opts.frida) s.push({ key: "frida", code: "04", label: "Frida gadget" });
+    s.push({ key: "build", code: opts.frida ? "05" : "04", label: "Rebuild" });
+    s.push({ key: "align", code: opts.frida ? "06" : "05", label: "Zipalign" });
+    s.push({ key: "sign", code: opts.frida ? "07" : "06", label: "Sign" });
     return s;
-  }, [source, frida]);
+  }, [source, opts.frida]);
 
   // ── Effects ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -125,8 +123,10 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
     invoke<string[]>("check_apk_tools")
       .then(setMissingTools)
       .catch(() => setMissingTools([]));
-    refreshDevices();
     // reset transient run state when reopened
+    setOpts(DEFAULT_PATCH_OPTS);
+    setApkPath("");
+    setPkg("");
     setRun("idle");
     setResult(null);
     setErrorMsg("");
@@ -146,7 +146,9 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
         else if (e.payload.type === "leave") setDragOver(false);
         else if (e.payload.type === "drop") {
           setDragOver(false);
-          const apk = e.payload.paths.find((p) => p.toLowerCase().endsWith(".apk"));
+          const apk = e.payload.paths.find((p) =>
+            p.toLowerCase().endsWith(".apk"),
+          );
           if (apk) setApkPath(apk);
         }
       })
@@ -156,30 +158,22 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
 
   useEffect(() => () => unlistenRef.current?.(), []);
 
-  const refreshDevices = useCallback(async () => {
-    try {
-      const ds = await invoke<AdbDevice[]>("list_adb_devices");
-      setDevices(ds);
-      if (ds.length && !ds.some((d) => d.serial === serial)) {
-        setSerial(ds[0].serial);
-      }
-    } catch {
-      setDevices([]);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serial]);
-
-  // Load packages when a device is chosen.
-  useEffect(() => {
-    if (source !== "device" || !serial) return;
+  const refreshPackages = useCallback(() => {
+    if (!serial) return;
     setPkgLoading(true);
     setPackages([]);
-    setPkg("");
     invoke<DevicePackage[]>("list_device_packages", { serial })
       .then((p) => setPackages(p))
       .catch(() => setPackages([]))
       .finally(() => setPkgLoading(false));
-  }, [source, serial]);
+  }, [serial]);
+
+  // Load the device's apps when patching from a device.
+  useEffect(() => {
+    if (!open || source !== "device" || !serial) return;
+    setPkg("");
+    refreshPackages();
+  }, [open, source, serial, refreshPackages]);
 
   const browseApk = async () => {
     try {
@@ -194,26 +188,12 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
     }
   };
 
-  const browseGadget = async () => {
-    try {
-      const picked = await openFileDialog({
-        multiple: false,
-        directory: false,
-        filters: [{ name: "Frida gadget", extensions: ["so"] }],
-      });
-      if (typeof picked === "string") setFridaPath(picked);
-    } catch {
-      /* cancelled */
-    }
-  };
-
   const canPatch =
     run !== "running" &&
     missingTools !== null &&
     missingTools.length === 0 &&
-    (embedCa || trustUser) &&
-    (source === "file" ? apkPath !== "" : serial !== "" && pkg !== "") &&
-    (!frida || fridaPath !== "");
+    patchOptsValid(opts) &&
+    (source === "file" ? apkPath !== "" : pkg !== "");
 
   const startPatch = async () => {
     setRun("running");
@@ -225,9 +205,12 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
     try {
       // Subscribe to progress for the rail.
       unlistenRef.current?.();
-      unlistenRef.current = await listen<PatchProgress>("apk-patch-progress", (e) => {
-        setActiveStage(e.payload.stage);
-      });
+      unlistenRef.current = await listen<PatchProgress>(
+        "apk-patch-progress",
+        (e) => {
+          setActiveStage(e.payload.stage);
+        },
+      );
 
       let path = apkPath;
       if (source === "device") {
@@ -235,15 +218,7 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
         setApkPath(path);
       }
       const res = await invoke<PatchResult>("patch_apk", {
-        opts: {
-          apkPath: path,
-          embedProxyCa: embedCa,
-          trustUserStore: trustUser,
-          makeDebuggable: debuggable,
-          injectFrida: frida,
-          fridaGadgetPath: fridaPath,
-          fridaAbi: fridaAbi,
-        },
+        opts: backendPatchOpts(path, opts),
       });
       setResult(res);
       setActiveStage("done");
@@ -262,11 +237,34 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
     setInstallState("installing");
     setInstallMsg("");
     try {
-      await invoke<string>("install_patched_apk", {
+      const res = await invoke<{ status: string; message: string }>(
+        "install_patched_apk",
+        {
+          serial,
+          apkPath: result.outputPath,
+          package: pkg || undefined,
+        },
+      );
+      setInstallMsg(res.message);
+      // Signature clash: replacing would wipe the app's data — ask first.
+      setInstallState(res.status === "needsReplace" ? "confirm" : "done");
+    } catch (err) {
+      setInstallState("error");
+      setInstallMsg(String(err));
+    }
+  };
+
+  // User confirmed the data-wiping reinstall from the "confirm" prompt.
+  const confirmReplace = async () => {
+    if (!result || !serial) return;
+    setInstallState("installing");
+    try {
+      const msg = await invoke<string>("replace_patched_apk", {
         serial,
         apkPath: result.outputPath,
-        package: source === "device" ? pkg : undefined,
+        package: pkg,
       });
+      setInstallMsg(msg);
       setInstallState("done");
     } catch (err) {
       setInstallState("error");
@@ -292,7 +290,10 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
   };
 
   return (
-    <Dialog open={open} onOpenChange={(o) => run !== "running" && onOpenChange(o)}>
+    <Dialog
+      open={open}
+      onOpenChange={(o) => run !== "running" && onOpenChange(o)}
+    >
       <DialogContent className="bg-bg-1 border-border max-w-2xl p-0 flex flex-col gap-0 max-h-[88vh] overflow-hidden">
         <style>{RAIL_CSS}</style>
 
@@ -301,8 +302,22 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
             <Boxes className="size-5" /> Patch APK
           </DialogTitle>
           <DialogDescription className="text-text-2 text-xs">
-            Repackage an Android app to trust the proxy CA — decrypt its HTTPS in
-            the inspector. For authorized analysis only.
+            {source === "device" ? (
+              <>
+                Repackage{" "}
+                <span className="text-text-1">
+                  {device?.model || device?.serial}
+                </span>
+                's app to trust the proxy CA, then reinstall it — decrypt its
+                HTTPS in the inspector. For authorized analysis only.
+              </>
+            ) : (
+              <>
+                Repackage a local <span className="text-text-1">.apk</span> to
+                trust the proxy CA — decrypt its HTTPS in the inspector. For
+                authorized analysis only.
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
 
@@ -323,16 +338,6 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
           {/* ── Left: configuration ─────────────────────────────────── */}
           <ScrollArea className="min-h-0 border-r border-border/60">
             <div className="px-6 py-5 space-y-5">
-              {/* Source toggle */}
-              <Segmented
-                value={source}
-                onChange={(v) => setSource(v as Source)}
-                options={[
-                  { value: "file", label: "Local file", icon: <FileDown className="size-3.5" /> },
-                  { value: "device", label: "From device", icon: <Smartphone className="size-3.5" /> },
-                ]}
-              />
-
               {source === "file" ? (
                 <button
                   type="button"
@@ -350,7 +355,8 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
                     </span>
                   ) : (
                     <span className="text-xs text-muted-foreground">
-                      Drag an <span className="text-text-1">.apk</span> here, or click to browse
+                      Drag an <span className="text-text-1">.apk</span> here, or
+                      click to browse
                     </span>
                   )}
                 </button>
@@ -360,111 +366,57 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
                     <Label className="text-[11px] uppercase tracking-wider text-muted-foreground">
                       Device
                     </Label>
-                    <div className="flex items-center gap-2">
-                      <Select value={serial} onValueChange={setSerial}>
-                        <SelectTrigger className="h-8 text-sm flex-1">
-                          <SelectValue placeholder={devices.length ? "Select device" : "No devices"} />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {devices.map((d) => (
-                            <SelectItem key={d.serial} value={d.serial}>
-                              {d.model || d.serial}
-                              <span className="text-muted-foreground ml-1.5 text-[11px]">
-                                {d.state}
-                              </span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <Button variant="outline" size="xs" onClick={refreshDevices} aria-label="Refresh devices">
-                        <RefreshCw className="size-3.5" />
-                      </Button>
+                    <div className="flex items-center gap-2 rounded-md border border-border/60 bg-bg-2/30 px-3 h-8 text-sm text-text-0">
+                      <Smartphone className="size-3.5 text-muted-foreground shrink-0" />
+                      <span className="truncate">
+                        {device?.model || device?.serial}
+                      </span>
                     </div>
                   </div>
 
                   <div className="space-y-1.5">
                     <Label className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                      Package {pkgLoading && <span className="text-text-2">· loading…</span>}
+                      Package{" "}
+                      {pkgLoading && (
+                        <span className="text-text-2">· loading…</span>
+                      )}
                     </Label>
-                    <Select value={pkg} onValueChange={setPkg} disabled={!serial || pkgLoading}>
-                      <SelectTrigger className="h-8 text-sm">
-                        <SelectValue placeholder="Select app" />
-                      </SelectTrigger>
-                      <SelectContent className="max-h-72">
-                        {packages.map((p) => (
-                          <SelectItem key={p.package} value={p.package}>
-                            <span className="font-mono text-[12px]">{p.package}</span>
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                    <div className="flex items-center gap-2">
+                      <Select
+                        value={pkg}
+                        onValueChange={setPkg}
+                        disabled={!serial || pkgLoading}
+                      >
+                        <SelectTrigger className="h-8 text-sm flex-1">
+                          <SelectValue placeholder="Select app" />
+                        </SelectTrigger>
+                        <SelectContent className="max-h-72">
+                          {packages.map((p) => (
+                            <SelectItem key={p.package} value={p.package}>
+                              <span className="font-mono text-[12px]">
+                                {p.package}
+                              </span>
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        onClick={refreshPackages}
+                        aria-label="Refresh packages"
+                      >
+                        <RefreshCw className="size-3.5" />
+                      </Button>
+                    </div>
                   </div>
                 </div>
               )}
 
               {/* Options */}
-              <div className="space-y-px rounded-md border border-border/60 overflow-hidden">
-                <OptionRow
-                  icon={<ShieldCheck className="size-3.5" />}
-                  title="Embed proxy CA"
-                  hint="Bake the CA into the app — no cert install on the phone."
-                  checked={embedCa}
-                  onChange={setEmbedCa}
-                />
-                <OptionRow
-                  title="Trust user CA store"
-                  hint="Also trust certs installed on the device."
-                  checked={trustUser}
-                  onChange={setTrustUser}
-                />
-                <OptionRow
-                  title="Make debuggable"
-                  hint="Set android:debuggable — eases runtime hooking."
-                  checked={debuggable}
-                  onChange={setDebuggable}
-                />
-                <OptionRow
-                  icon={<Syringe className="size-3.5" />}
-                  title="Inject Frida gadget"
-                  hint="Defeat code-level cert pinning on non-rooted devices."
-                  checked={frida}
-                  onChange={setFrida}
-                />
-                {frida && (
-                  <div className="px-3 py-3 bg-bg-2/40 space-y-2">
-                    <div className="flex items-center gap-2">
-                      <Input
-                        value={fridaPath}
-                        placeholder="path to libfrida-gadget.so"
-                        spellCheck={false}
-                        onChange={(e) => setFridaPath(e.target.value)}
-                        className="h-7 text-[12px] font-mono flex-1"
-                      />
-                      <Button variant="outline" size="xs" onClick={browseGadget}>
-                        <FolderOpen className="size-3.5" />
-                      </Button>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Cpu className="size-3.5 text-muted-foreground" />
-                      <Label className="text-[11px] text-muted-foreground">ABI</Label>
-                      <Select value={fridaAbi} onValueChange={setFridaAbi}>
-                        <SelectTrigger className="h-7 text-xs w-40">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="auto">auto-detect</SelectItem>
-                          <SelectItem value="arm64-v8a">arm64-v8a</SelectItem>
-                          <SelectItem value="armeabi-v7a">armeabi-v7a</SelectItem>
-                          <SelectItem value="x86_64">x86_64</SelectItem>
-                          <SelectItem value="x86">x86</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                )}
-              </div>
+              <PatchOptions opts={opts} onChange={patchOpt} />
 
-              {!embedCa && !trustUser && (
+              {!opts.embedCa && !opts.trustUser && (
                 <p className="text-[11px] text-destructive">
                   Enable at least one trust anchor (embed CA or user store).
                 </p>
@@ -482,7 +434,10 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
                 {stages.map((s, i) => {
                   const st = stageStatus(i);
                   return (
-                    <div key={s.key} className="relative flex items-start gap-3 pb-5 last:pb-0">
+                    <div
+                      key={s.key}
+                      className="relative flex items-start gap-3 pb-5 last:pb-0"
+                    >
                       {/* connector */}
                       {i < stages.length - 1 && (
                         <span
@@ -516,7 +471,9 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
                       <div className="pt-0.5 min-w-0">
                         <div
                           className={`text-[10px] font-mono tracking-wider ${
-                            st === "pending" ? "text-muted-foreground" : "text-text-2"
+                            st === "pending"
+                              ? "text-muted-foreground"
+                              : "text-text-2"
                           }`}
                         >
                           {s.code}
@@ -558,7 +515,9 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
                   {result.outputPath}
                 </span>
                 <button
-                  onClick={() => navigator.clipboard.writeText(result.outputPath)}
+                  onClick={() =>
+                    navigator.clipboard.writeText(result.outputPath)
+                  }
                   className="text-muted-foreground hover:text-text-0 shrink-0"
                   aria-label="Copy path"
                 >
@@ -568,7 +527,10 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
               {result.warnings.length > 0 && (
                 <ul className="space-y-1">
                   {result.warnings.map((w, i) => (
-                    <li key={i} className="flex items-start gap-1.5 text-[10px] text-muted-foreground leading-snug">
+                    <li
+                      key={i}
+                      className="flex items-start gap-1.5 text-[10px] text-muted-foreground leading-snug"
+                    >
                       <TriangleAlert className="size-3 shrink-0 mt-0.5" />
                       <span>{w}</span>
                     </li>
@@ -587,12 +549,16 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
                   : "Output is re-signed with a debug key"}
             </div>
             <div className="flex items-center gap-2">
-              {finished && devices.length > 0 && (
+              {finished && source === "device" && (
                 <Button
                   variant="outline"
                   size="sm"
                   onClick={installToDevice}
-                  disabled={installState === "installing" || !serial}
+                  disabled={
+                    installState === "installing" ||
+                    installState === "confirm" ||
+                    !serial
+                  }
                 >
                   {installState === "installing" ? (
                     <Spinner size={14} />
@@ -616,69 +582,49 @@ export default function PatchApkDialog({ open, onOpenChange }: Props) {
             </div>
           </div>
           {installState === "error" && (
-            <p className="text-[11px] text-destructive font-mono break-all">{installMsg}</p>
+            <p className="text-[11px] text-destructive font-mono break-all">
+              {installMsg}
+            </p>
+          )}
+          {installState === "confirm" && (
+            <div className="flex items-start gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-3">
+              <TriangleAlert className="size-4 text-yellow-500 shrink-0 mt-0.5" />
+              <div className="space-y-2.5">
+                <p className="text-[11px] text-text-1 leading-relaxed">
+                  {installMsg} Replace it anyway?
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={confirmReplace}
+                  >
+                    Replace &amp; erase data
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setInstallState("idle")}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
+          {installState === "done" && installMsg.includes("data was cleared") && (
+            <div className="flex items-start gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2">
+              <TriangleAlert className="size-4 text-yellow-500 shrink-0 mt-0.5" />
+              <p className="text-[11px] text-text-1 leading-relaxed">
+                The installed app was signed differently than the version already
+                on the device, so the original had to be uninstalled and replaced
+                — <span className="font-medium">its existing data was erased.</span>
+              </p>
+            </div>
           )}
         </div>
       </DialogContent>
     </Dialog>
-  );
-}
-
-// ── Small building blocks ──────────────────────────────────────────────────
-
-function Segmented({
-  value,
-  onChange,
-  options,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  options: { value: string; label: string; icon: React.ReactNode }[];
-}) {
-  return (
-    <div className="grid grid-cols-2 gap-1 p-1 rounded-md bg-bg-2/50 border border-border/60">
-      {options.map((o) => (
-        <button
-          key={o.value}
-          onClick={() => onChange(o.value)}
-          className={`flex items-center justify-center gap-1.5 h-7 rounded text-xs transition-colors ${
-            value === o.value
-              ? "bg-bg-1 text-text-0 shadow-sm border border-border/80"
-              : "text-muted-foreground hover:text-text-1"
-          }`}
-        >
-          {o.icon}
-          {o.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function OptionRow({
-  icon,
-  title,
-  hint,
-  checked,
-  onChange,
-}: {
-  icon?: React.ReactNode;
-  title: string;
-  hint: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <label className="flex items-center gap-3 px-3 py-2.5 bg-bg-1 hover:bg-bg-2/30 transition-colors cursor-pointer border-b border-border/40 last:border-b-0">
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-1.5 text-sm text-text-0">
-          {icon}
-          {title}
-        </div>
-        <div className="text-[11px] text-muted-foreground leading-snug">{hint}</div>
-      </div>
-      <Switch checked={checked} onChange={onChange} />
-    </label>
   );
 }
 

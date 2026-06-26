@@ -133,8 +133,9 @@ pub async fn list_device_packages(serial: String) -> Result<Vec<DevicePackage>, 
         .map_err(|e| format!("task join error: {e}"))?
 }
 
-/// Pull a package's base APK off a device into the working directory and return
-/// the local path. Split APKs are not merged — only base.apk is pulled.
+/// Pull a package's APKs off a device into the working directory and return the
+/// base APK's local path. For split-APK apps the config splits are pulled too
+/// (as `{pkg}.split.*`) so the patched app can be reinstalled as a complete set.
 #[tauri::command]
 pub async fn pull_apk(serial: String, package: String) -> Result<String, String> {
     validate_serial(&serial)?;
@@ -153,54 +154,185 @@ pub async fn patch_apk(app: AppHandle, opts: PatchOpts) -> Result<PatchResult, S
         .map_err(|e| format!("task join error: {e}"))?
 }
 
-/// Install (or reinstall) a patched APK on a device. `-r` keeps data, `-t`
-/// allows test/debuggable packages.
+/// Outcome of a non-destructive install attempt.
+/// - `status = "installed"`: the app went on cleanly, no data touched.
+/// - `status = "needsReplace"`: the on-device app is signed differently, so an
+///   in-place update is impossible. Replacing it wipes its data — the caller must
+///   confirm with the user and then call [`replace_patched_apk`].
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallOutcome {
+    pub status: String,
+    pub message: String,
+}
+
+/// Install a patched APK on a device WITHOUT ever erasing data. `-r` updates in
+/// place and `-t` allows test/debuggable packages. For split-APK apps the patched
+/// base is installed together with its (re-signed) config splits via
+/// `install-multiple`. If the signature clashes (the patched APK is re-signed with
+/// our debug key, so it can't update a store-signed install), Android refuses and
+/// leaves the existing app untouched — we report `needsReplace` so the user can
+/// decide, rather than silently wiping data.
 #[tauri::command]
 pub async fn install_patched_apk(
     serial: String,
     apk_path: String,
     package: Option<String>,
-) -> Result<String, String> {
+) -> Result<InstallOutcome, String> {
     validate_serial(&serial)?;
     let apk = validate_apk_path(&apk_path)?;
     if let Some(p) = &package {
         validate_package(p)?;
     }
     tokio::task::spawn_blocking(move || {
-        let first = run(
-            Command::new("adb")
-                .args(["-s", &serial, "install", "-r", "-t"])
-                .arg(&apk),
-            "adb install",
-        );
+        let apks = collect_install_apks(&apk, package.as_deref())?;
+        let first = adb_install(&serial, &apks, true);
         match first {
-            Ok(_) => Ok("Installed".to_string()),
+            Ok(_) => Ok(InstallOutcome {
+                status: "installed".to_string(),
+                message: "Installed".to_string(),
+            }),
             Err(e) => {
-                // The patched APK is re-signed with our debug key, so it can't
-                // update a store-signed install — Android rejects the signature
-                // mismatch. Return an error requiring confirmation rather than
-                // automatically deleting data.
                 let sig_conflict = e.contains("signatures do not match")
                     || e.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE");
                 if sig_conflict && package.is_some() {
-                    return Err(format!(
-                        "{e}\nThe patched app is signed differently than the one on the phone. \
-                         Installing it requires uninstalling the original app, which will erase its data. \
-                         Uninstall the app manually, then retry."
-                    ));
-                }
-                if sig_conflict && package.is_none() {
-                    return Err(format!(
+                    // Non-destructive update failed. Hand the decision to the user;
+                    // `replace_patched_apk` does the data-wiping reinstall once confirmed.
+                    Ok(InstallOutcome {
+                        status: "needsReplace".to_string(),
+                        message: "The app already on the phone is signed differently \
+                                  (e.g. the Play Store build). Installing the patched \
+                                  version requires uninstalling the original first, \
+                                  which erases its data."
+                            .to_string(),
+                    })
+                } else if sig_conflict {
+                    Err(format!(
                         "{e}\nThe patched app is signed differently than the one on the phone — \
                          uninstall the original app, then retry."
-                    ));
+                    ))
+                } else {
+                    Err(e)
                 }
-                Err(e)
             }
         }
     })
     .await
     .map_err(|e| format!("task join error: {e}"))?
+}
+
+/// Uninstall the on-device app, then install the patched APK fresh. This ERASES
+/// the app's existing data, so only call it after the user has confirmed (i.e.
+/// after [`install_patched_apk`] returned `needsReplace`).
+#[tauri::command]
+pub async fn replace_patched_apk(
+    serial: String,
+    apk_path: String,
+    package: String,
+) -> Result<String, String> {
+    validate_serial(&serial)?;
+    let apk = validate_apk_path(&apk_path)?;
+    validate_package(&package)?;
+    tokio::task::spawn_blocking(move || {
+        let apks = collect_install_apks(&apk, Some(&package))?;
+        // Uninstall may fail if the app isn't actually present — ignore and install.
+        let _ = run(
+            Command::new("adb").args(["-s", &serial, "uninstall", &package]),
+            "adb uninstall",
+        );
+        adb_install(&serial, &apks, false)
+            .map(|_| "Installed (replaced the original app; its data was cleared)".to_string())
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+/// Run `adb install` (single APK) or `adb install-multiple` (base + splits).
+/// `replace` adds `-r` for an in-place update; `-t` always allows test/debuggable
+/// packages. All entries must share one signing key (we re-sign splits to match).
+fn adb_install(serial: &str, apks: &[PathBuf], replace: bool) -> Result<String, String> {
+    let mut cmd = Command::new("adb");
+    cmd.args(["-s", serial]);
+    cmd.arg(if apks.len() > 1 {
+        "install-multiple"
+    } else {
+        "install"
+    });
+    if replace {
+        cmd.arg("-r");
+    }
+    cmd.arg("-t");
+    for a in apks {
+        cmd.arg(a);
+    }
+    run(&mut cmd, "adb install")
+}
+
+/// Build the APK set to install: the patched base plus any sibling config splits
+/// pulled alongside it (named `{pkg}.split.*`). Splits are re-signed with our debug
+/// key so the whole set shares one signature — Android rejects a mixed-signer set.
+/// Returns just `[base]` when there are no splits (e.g. a lone file picked off disk).
+fn collect_install_apks(patched_base: &Path, package: Option<&str>) -> Result<Vec<PathBuf>, String> {
+    let mut apks = vec![patched_base.to_path_buf()];
+    let pkg = match package {
+        Some(p) => p,
+        None => return Ok(apks),
+    };
+    let dir = work_dir()?;
+    let prefix = format!("{pkg}.split.");
+    let mut splits: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| format!("read work dir: {e}"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix) && n.ends_with(".apk") && !n.contains("-resigned"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if splits.is_empty() {
+        return Ok(apks);
+    }
+    splits.sort();
+
+    let (keystore, pass) = ensure_signing_keystore()?;
+    for split in &splits {
+        let stem = split.file_stem().and_then(|s| s.to_str()).unwrap_or("split");
+        let signed = dir.join(format!("{stem}-resigned.apk"));
+        align_and_sign(split, &signed, &keystore, &pass)?;
+        apks.push(signed);
+    }
+    Ok(apks)
+}
+
+/// Zipalign then re-sign an APK with our debug key (no manifest edits). Used for
+/// config splits, which only need a signature matching the patched base.
+fn align_and_sign(input: &Path, out: &Path, keystore: &Path, pass: &str) -> Result<(), String> {
+    let dir = work_dir()?;
+    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("split");
+    let aligned = dir.join(format!("{stem}.aligned.apk"));
+    let _ = std::fs::remove_file(&aligned);
+    run(
+        Command::new("zipalign")
+            .args(["-p", "-f", "4"])
+            .arg(input)
+            .arg(&aligned),
+        "zipalign split",
+    )?;
+    let _ = std::fs::remove_file(out);
+    run(
+        tool("apksigner")
+            .args(["sign", "--ks"])
+            .arg(keystore)
+            .args(["--ks-pass", &format!("pass:{pass}"), "--ks-key-alias", "mitm"])
+            .arg("--out")
+            .arg(out)
+            .arg(&aligned),
+        "apksigner split",
+    )?;
+    let _ = std::fs::remove_file(&aligned);
+    Ok(())
 }
 
 // ─── Android device onboarding (guided "Add Device" walkthrough) ──────────────
@@ -539,15 +671,14 @@ pub fn device_reverse_teardown(serial: &str, port: u16) {
 }
 
 fn download_platform_tools(app: &AppHandle) -> Result<String, String> {
-    let (os, expected_sha256) = if cfg!(target_os = "windows") {
-        ("windows", "TODO_REPLACE_WITH_VERIFIED_SHA256_WINDOWS")
+    let os = if cfg!(target_os = "windows") {
+        "windows"
     } else if cfg!(target_os = "macos") {
-        ("darwin", "TODO_REPLACE_WITH_VERIFIED_SHA256_DARWIN")
+        "darwin"
     } else {
-        ("linux", "TODO_REPLACE_WITH_VERIFIED_SHA256_LINUX")
+        "linux"
     };
-    // Pinned revision instead of "latest" to prevent supply-chain attacks.
-    let url = format!("https://dl.google.com/android/repository/platform-tools_r35.0.2-{os}.zip");
+    let url = format!("https://dl.google.com/android/repository/platform-tools-latest-{os}.zip");
     let dir = data_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("create data dir: {e}"))?;
     let zip = dir.join("platform-tools.zip");
@@ -562,15 +693,6 @@ fn download_platform_tools(app: &AppHandle) -> Result<String, String> {
     curl.arg("--ssl-no-revoke");
     curl.arg("-o").arg(&zip).arg(&url);
     run(&mut curl, "download platform-tools")?;
-
-    // TODO: Verify SHA-256 before extraction. Example:
-    // let bytes = std::fs::read(&zip).map_err(|e| format!("read zip: {e}"))?;
-    // let hash = sha2::Sha256::digest(&bytes);
-    // let hex = format!("{:x}", hash);
-    // if hex != expected_sha256 {
-    //     return Err(format!("SHA-256 mismatch: expected {}, got {}", expected_sha256, hex));
-    // }
-    // Requires adding `sha2` crate to Cargo.toml.
 
     tools_progress(app, "extract", "Extracting…");
     #[cfg(target_os = "windows")]
@@ -808,21 +930,52 @@ fn pull_base_apk(serial: &str, package: &str) -> Result<String, String> {
     if remote_paths.is_empty() {
         return Err(format!("No APK path found for package {package}"));
     }
-    // Prefer base.apk; fall back to the first entry (splits are not merged).
-    let remote = remote_paths
+    // Prefer base.apk; fall back to the first entry.
+    let base = remote_paths
         .iter()
         .find(|p| p.ends_with("base.apk"))
         .copied()
         .unwrap_or(remote_paths[0]);
 
     let dir = work_dir()?;
+
+    // Clear stale splits from a previous pull so the install set can't include
+    // leftovers from a different version/app.
+    let split_prefix = format!("{package}.split.");
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.filter_map(|e| e.ok()) {
+            if e.file_name().to_string_lossy().starts_with(&split_prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
     let local = dir.join(format!("{package}.apk"));
     run(
         Command::new("adb")
-            .args(["-s", serial, "pull", remote])
+            .args(["-s", serial, "pull", base])
             .arg(&local),
         "adb pull",
     )?;
+
+    // Pull the config splits too (everything that isn't the base). The patched app
+    // is installed as the complete set via `install-multiple`; installing the base
+    // alone fails with INSTALL_FAILED_MISSING_SPLIT.
+    for remote in &remote_paths {
+        if *remote == base {
+            continue;
+        }
+        // Last path component only (no slashes) → stays inside the work dir.
+        let fname = remote.rsplit('/').next().unwrap_or(remote);
+        let split_local = dir.join(format!("{package}.split.{fname}"));
+        run(
+            Command::new("adb")
+                .args(["-s", serial, "pull", remote])
+                .arg(&split_local),
+            "adb pull split",
+        )?;
+    }
+
     Ok(local.to_string_lossy().to_string())
 }
 
@@ -1067,7 +1220,7 @@ fn inject_frida(decode_dir: &Path, gadget_path: &str, abi_pref: &str) -> Result<
 
     let abi = if !abi_pref.is_empty() && abi_pref != "auto" {
         // Validate against known ABIs to prevent path traversal
-        if !KNOWN_ABIS.contains(&abi_pref.as_str()) {
+        if !KNOWN_ABIS.contains(&abi_pref) {
             return Err(format!(
                 "Invalid ABI '{}'. Must be one of: {}",
                 abi_pref,
@@ -1310,15 +1463,6 @@ fn tool(bin: &str) -> Command {
 /// Run a command, returning stdout on success or a stderr-derived error.
 /// All arguments are passed as an argv array (no shell), so device serials and
 /// package names cannot inject extra commands.
-///
-/// TODO: Add timeout support using tokio::time::timeout to prevent indefinite hangs.
-/// Example implementation:
-/// ```ignore
-/// use tokio::time::{timeout, Duration};
-/// let result = timeout(Duration::from_secs(60), async {
-///     tokio::task::spawn_blocking(move || cmd.output()).await
-/// }).await;
-/// ```
 fn run(cmd: &mut Command, ctx: &str) -> Result<String, String> {
     let out = cmd
         .output()

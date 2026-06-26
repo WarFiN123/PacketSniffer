@@ -108,7 +108,9 @@ export default function App() {
   const [statusClasses, setStatusClasses] = useState<Set<StatusClass>>(
     new Set(),
   );
-  const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
+  const [selectedDomains, setSelectedDomains] = useState<Set<string>>(
+    new Set(),
+  );
   const [showPinnedOnly, setShowPinnedOnly] = useState(false);
   const [pinnedIds, setPinnedIds] = useState<Set<number>>(new Set());
 
@@ -118,9 +120,28 @@ export default function App() {
 
   const handleSelectSource = useCallback((source: string) => {
     setSourceFilter(source);
-    setSelectedDomain(null);
+    setSelectedDomains(new Set());
     setShowPinnedOnly(false);
   }, []);
+
+  // Plain click selects a single domain (or clears it if it was the only one);
+  // Ctrl/Cmd-click toggles a domain so several show at once.
+  const handleSelectDomain = useCallback(
+    (domain: string, additive: boolean) => {
+      setShowPinnedOnly(false);
+      setSelectedDomains((prev) => {
+        if (additive) {
+          const next = new Set(prev);
+          if (next.has(domain)) next.delete(domain);
+          else next.add(domain);
+          return next;
+        }
+        if (prev.size === 1 && prev.has(domain)) return new Set();
+        return new Set([domain]);
+      });
+    },
+    [],
+  );
 
   const handleConnected = useCallback((device: ConnectedDevice) => {
     setDevices((prev) => {
@@ -177,6 +198,10 @@ export default function App() {
   const [mapOpen, setMapOpen] = useState(false);
   const [addDeviceOpen, setAddDeviceOpen] = useState(false);
   const [patchApkOpen, setPatchApkOpen] = useState(false);
+  // When set, the patch dialog targets an installed app on this device; null
+  // means the local-file patch flow from the Tools menu.
+  const [patchApkDevice, setPatchApkDevice] =
+    useState<ConnectedDevice | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
 
   // Interception rules (No-Cache, block/allow, map, throttle) — single source
@@ -297,7 +322,8 @@ export default function App() {
           : s.clientAddr === sourceFilter;
       if (!inSource) return false;
 
-      if (selectedDomain && s.host !== selectedDomain) return false;
+      if (selectedDomains.size > 0 && !selectedDomains.has(s.host))
+        return false;
 
       if (!matchesContentFilter(s, contentFilter)) return false;
 
@@ -322,7 +348,7 @@ export default function App() {
     debouncedFilter,
     contentFilter,
     statusClasses,
-    selectedDomain,
+    selectedDomains,
     showPinnedOnly,
     pinnedIds,
     sourceFilter,
@@ -363,7 +389,10 @@ export default function App() {
           onOpenNetwork={() => setNetworkOpen(true)}
           onOpenBlockList={() => setBlockOpen(true)}
           onOpenMap={() => setMapOpen(true)}
-          onOpenPatchApk={() => setPatchApkOpen(true)}
+          onOpenPatchApk={() => {
+            setPatchApkDevice(null);
+            setPatchApkOpen(true);
+          }}
           onOpenUpdate={() => setUpdateOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
           onExportSession={handleExportSession}
@@ -394,16 +423,17 @@ export default function App() {
                 onSelectSource={handleSelectSource}
                 onAddDevice={() => setAddDeviceOpen(true)}
                 onRemoveDevice={handleRemoveDevice}
-                selectedDomain={selectedDomain}
-                onSelectDomain={(d) => {
-                  setShowPinnedOnly(false);
-                  setSelectedDomain(d);
+                onPatchDevice={(d) => {
+                  setPatchApkDevice(d);
+                  setPatchApkOpen(true);
                 }}
+                selectedDomains={selectedDomains}
+                onSelectDomain={handleSelectDomain}
                 showPinnedOnly={showPinnedOnly}
                 onTogglePinned={() => {
                   const next = !showPinnedOnly;
                   setShowPinnedOnly(next);
-                  if (next) setSelectedDomain(null);
+                  if (next) setSelectedDomains(new Set());
                 }}
                 pinnedCount={pinnedIds.size}
               />
@@ -496,7 +526,11 @@ export default function App() {
           onConnected={handleConnected}
         />
 
-        <PatchApkDialog open={patchApkOpen} onOpenChange={setPatchApkOpen} />
+        <PatchApkDialog
+          open={patchApkOpen}
+          onOpenChange={setPatchApkOpen}
+          device={patchApkDevice}
+        />
 
         <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
 

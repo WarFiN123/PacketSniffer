@@ -48,7 +48,7 @@ jobs:
       # Cargo registry index/cache only — no build artifacts here, so the full
       # rust-cache action would be wasted weight. This just speeds `cargo update`.
       - name: cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -140,7 +140,7 @@ jobs:
           bun-version: latest
 
       - name: cache bun dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
