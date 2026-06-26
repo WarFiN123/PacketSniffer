@@ -70,10 +70,36 @@ impl ProxyEngine {
         let on_ws_message = Arc::clone(&self.on_ws_message);
 
         tokio::spawn(async move {
-            accept_loop(listener, ca, next_id, on_event, on_ws_message, stop_rx).await;
+            accept_loop(listener, ca, next_id, on_event, on_ws_message, stop_rx, None).await;
         });
 
         Ok(actual_port)
+    }
+
+    /// Start an extra listener on a free loopback port whose sessions are all
+    /// tagged with `tag` (a device label), reusing this engine's CA/callbacks
+    /// and id counter. Used for USB `adb reverse` device capture: the peer is
+    /// always 127.0.0.1 there, so we can't identify the device by source IP —
+    /// the tag stands in. Returns the bound port and a stop handle.
+    pub async fn start_tagged(
+        &self,
+        tag: Arc<str>,
+    ) -> Result<(u16, watch::Sender<bool>), Box<dyn std::error::Error + Send + Sync>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let ca = Arc::new(
+            CertificateAuthority::initialize(None)
+                .map_err(|e| format!("CA init failed: {}", e))?,
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let next_id = Arc::clone(&self.next_id);
+        let on_event = Arc::clone(&self.on_event);
+        let on_ws_message = Arc::clone(&self.on_ws_message);
+        tokio::spawn(async move {
+            accept_loop(listener, ca, next_id, on_event, on_ws_message, stop_rx, Some(tag)).await;
+        });
+        log::info!("Device capture listening on 127.0.0.1:{}", port);
+        Ok((port, stop_tx))
     }
 
     pub async fn stop(self) {
@@ -94,18 +120,26 @@ async fn accept_loop(
     on_event: Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
     on_ws_message: Arc<dyn Fn(WsMessage) + Send + Sync>,
     mut stop_rx: watch::Receiver<bool>,
+    tag: Option<Arc<str>>,
 ) {
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, addr)) => {
                         let ca = Arc::clone(&ca);
                         let next_id = Arc::clone(&next_id);
                         let on_event = Arc::clone(&on_event);
                         let on_ws_message = Arc::clone(&on_ws_message);
+                        // A device listener tags every session with the device
+                        // label; the main listener tags with the peer IP so the
+                        // UI can tell the host's own traffic from a phone's.
+                        let client: Arc<str> = match &tag {
+                            Some(t) => Arc::clone(t),
+                            None => Arc::from(addr.ip().to_string()),
+                        };
                         tokio::spawn(async move {
-                            if let Err(e) = serve_connection(stream, ca, next_id, on_event, on_ws_message).await {
+                            if let Err(e) = serve_connection(stream, client, ca, next_id, on_event, on_ws_message).await {
                                 log::debug!("Connection handler error: {}", e);
                             }
                         });
@@ -126,6 +160,7 @@ async fn accept_loop(
 /// Serve one proxy connection with hyper HTTP/1.1.
 async fn serve_connection(
     stream: TcpStream,
+    client: Arc<str>,
     ca: Arc<CertificateAuthority>,
     next_id: Arc<AtomicU64>,
     on_event: Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
@@ -139,12 +174,13 @@ async fn serve_connection(
         .serve_connection(
             io,
             service_fn(move |req: Request<Incoming>| {
+                let client = Arc::clone(&client);
                 let ca = Arc::clone(&ca);
                 let next_id = Arc::clone(&next_id);
                 let on_event = Arc::clone(&on_event);
                 let on_ws_message = Arc::clone(&on_ws_message);
                 async move {
-                    route_request(req, ca, next_id, on_event, on_ws_message).await
+                    route_request(req, client, ca, next_id, on_event, on_ws_message).await
                 }
             }),
         )
@@ -157,17 +193,18 @@ async fn serve_connection(
 /// Dispatch a request to the appropriate handler.
 async fn route_request(
     req: Request<Incoming>,
+    client: Arc<str>,
     ca: Arc<CertificateAuthority>,
     next_id: Arc<AtomicU64>,
     on_event: Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
     on_ws_message: Arc<dyn Fn(WsMessage) + Send + Sync>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     if req.method() == Method::CONNECT {
-        Ok(handle_connect(req, ca, next_id, on_event, on_ws_message))
+        Ok(handle_connect(req, client, ca, next_id, on_event, on_ws_message))
     } else if http::is_websocket_upgrade(req.headers()) {
-        Ok(handle_ws_upgrade(req, next_id, on_event, on_ws_message).await)
+        Ok(handle_ws_upgrade(req, client, next_id, on_event, on_ws_message).await)
     } else {
-        Ok(handle_plain_http(req, next_id, on_event).await)
+        Ok(handle_plain_http(req, client, next_id, on_event).await)
     }
 }
 
@@ -175,6 +212,7 @@ async fn route_request(
 
 fn handle_connect(
     req: Request<Incoming>,
+    client: Arc<str>,
     ca: Arc<CertificateAuthority>,
     next_id: Arc<AtomicU64>,
     on_event: Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
@@ -199,7 +237,7 @@ fn handle_connect(
             Ok(upgraded) => {
                 let stream = TokioIo::new(upgraded);
                 mitm::handle_connect(
-                    stream, hostname, port, ca, next_id, on_event, on_ws_message,
+                    stream, hostname, port, client, ca, next_id, on_event, on_ws_message,
                 )
                 .await;
             }
@@ -214,6 +252,7 @@ fn handle_connect(
 
 async fn handle_plain_http(
     req: Request<Incoming>,
+    client: Arc<str>,
     next_id: Arc<AtomicU64>,
     on_event: Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
 ) -> Response<Full<Bytes>> {
@@ -245,6 +284,7 @@ async fn handle_plain_http(
 
     let mut session = HttpSession::new_request(
         session_id,
+        &client,
         "http",
         &method,
         &host,
@@ -401,6 +441,7 @@ async fn handle_plain_http(
 
 async fn handle_ws_upgrade(
     req: Request<Incoming>,
+    client: Arc<str>,
     next_id: Arc<AtomicU64>,
     on_event: Arc<dyn Fn(&str, HttpSession) + Send + Sync>,
     on_ws_message: Arc<dyn Fn(WsMessage) + Send + Sync>,
@@ -426,7 +467,7 @@ async fn handle_ws_upgrade(
     let full_url = uri.to_string();
 
     let mut session = HttpSession::new_request(
-        session_id, "ws", &method, &host, &path, &full_url,
+        session_id, &client, "ws", &method, &host, &path, &full_url,
         http::version_str(version), req_headers.clone(), 0, None,
     );
     on_event("start", session.clone());

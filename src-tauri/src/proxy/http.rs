@@ -17,6 +17,10 @@ pub struct HttpHeader {
 #[serde(rename_all = "camelCase")]
 pub struct HttpSession {
     pub id: u64,
+    /// IP the proxied connection arrived from. `127.0.0.1` for the host's own
+    /// traffic; a LAN IP for a phone routed through the proxy. Lets the UI
+    /// separate "My computer" from each connected device.
+    pub client_addr: String,
     pub scheme: String,
     pub method: String,
     pub host: String,
@@ -48,8 +52,10 @@ pub struct HttpSession {
 }
 
 impl HttpSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_request(
         id: u64,
+        client_addr: &str,
         scheme: &str,
         method: &str,
         host: &str,
@@ -64,6 +70,7 @@ impl HttpSession {
         let has_request_body = request_body.is_some();
         Self {
             id,
+            client_addr: client_addr.to_string(),
             scheme: scheme.to_string(),
             method: method.to_string(),
             host: host.to_string(),
@@ -121,6 +128,7 @@ impl HttpSession {
     pub fn metadata_clone(&self) -> Self {
         Self {
             id: self.id,
+            client_addr: self.client_addr.clone(),
             scheme: self.scheme.clone(),
             method: self.method.clone(),
             host: self.host.clone(),

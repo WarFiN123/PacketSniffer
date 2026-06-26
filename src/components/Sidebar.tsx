@@ -1,19 +1,41 @@
 import { useMemo } from "react";
 import { cn } from "@/lib/utils";
-import { Globe, Pin, Save, ChevronRight, ChevronDown } from "lucide-react";
+import { Globe, Pin, Monitor, Smartphone, Apple, Plus } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { HttpSession } from "@/types";
+import type { ConnectedDevice, HttpSession } from "@/types";
 import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
-  ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+
+// "My computer" owns every request that arrived over loopback; a phone's
+// requests arrive from its own LAN IP. `LOCAL` is the sidebar's source key for
+// this computer.
+export const LOCAL_SOURCE = "local";
+const LIVE = "#00ca50";
+
+function isLocalAddr(addr?: string): boolean {
+  return (
+    !addr || addr === "::1" || addr === "localhost" || addr.startsWith("127.")
+  );
+}
 
 interface SidebarProps {
   sessions: Map<number, HttpSession>;
   order: number[];
+  devices: ConnectedDevice[];
+  sourceFilter: string;
+  onSelectSource: (source: string) => void;
+  onAddDevice: () => void;
+  onRemoveDevice: (serial: string) => void;
   selectedDomain: string | null;
   onSelectDomain: (domain: string | null) => void;
   showPinnedOnly: boolean;
@@ -24,26 +46,46 @@ interface SidebarProps {
 export default function Sidebar({
   sessions,
   order,
+  devices,
+  sourceFilter,
+  onSelectSource,
+  onAddDevice,
+  onRemoveDevice,
   selectedDomain,
   onSelectDomain,
   showPinnedOnly,
   onTogglePinned,
   pinnedCount,
 }: SidebarProps) {
-  // Build domain → count map
+  // Per-source request counts in a single pass.
+  const counts = useMemo(() => {
+    let local = 0;
+    const byIp = new Map<string, number>();
+    for (const id of order) {
+      const a = sessions.get(id)?.clientAddr;
+      if (isLocalAddr(a)) local++;
+      else if (a) byIp.set(a, (byIp.get(a) || 0) + 1);
+    }
+    return { local, byIp };
+  }, [order, sessions]);
+
+  // Domains belonging to the currently-selected source only.
   const domains = useMemo(() => {
     const map = new Map<string, number>();
     for (const id of order) {
       const s = sessions.get(id);
       if (!s) continue;
+      const inSource =
+        sourceFilter === LOCAL_SOURCE
+          ? isLocalAddr(s.clientAddr)
+          : s.clientAddr === sourceFilter;
+      if (!inSource) continue;
       map.set(s.host, (map.get(s.host) || 0) + 1);
     }
     return [...map.entries()].sort(
       (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
     );
-  }, [sessions, order]);
-
-  const totalCount = order.length;
+  }, [sessions, order, sourceFilter]);
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text).catch(() => {});
@@ -56,6 +98,7 @@ export default function Sidebar({
     >
       <ScrollArea className="flex-1 min-h-0 w-full overflow-hidden">
         <div className="py-2 px-2 overflow-hidden min-w-0">
+          {/* ── Favorites ──────────────────────────────────────────── */}
           <div className="pl-1 mb-1 text-muted-foreground text-[11px] font-semibold">
             Favorites
           </div>
@@ -91,101 +134,216 @@ export default function Sidebar({
             </button>
           </div>
 
+          {/* ── Sources ────────────────────────────────────────────── */}
           <div className="pl-1 mb-1 text-muted-foreground text-[11px] font-semibold">
-            All
+            Sources
           </div>
 
           <div className="space-y-0.5 min-w-0">
-            <button
-              onClick={() => onSelectDomain(null)}
-              className={cn(
-                "flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left min-w-0 overflow-hidden",
-                selectedDomain === null
-                  ? "bg-primary text-primary-foreground"
-                  : "hover:bg-muted/50 text-foreground",
-              )}
-            >
-              <ChevronDown
-                className={cn(
-                  "size-3.5 shrink-0",
-                  selectedDomain === null
-                    ? "text-primary-foreground/70"
-                    : "text-muted-foreground",
-                )}
+            {/* My computer */}
+            <SourceRow
+              icon={<Monitor className="size-3.5 shrink-0" />}
+              label="My computer"
+              count={counts.local}
+              selected={sourceFilter === LOCAL_SOURCE}
+              onSelect={() => onSelectSource(LOCAL_SOURCE)}
+            />
+            {sourceFilter === LOCAL_SOURCE && (
+              <DomainTree
+                domains={domains}
+                selectedDomain={selectedDomain}
+                onSelectDomain={onSelectDomain}
+                onCopy={handleCopy}
               />
-              <Globe className="size-3.5 shrink-0" />
-              <span className="flex-1 truncate min-w-0">Domains</span>
-              <span
-                className={cn(
-                  "text-[10px] tabular-nums font-semibold shrink-0",
-                  selectedDomain === null
-                    ? "text-primary-foreground"
-                    : "text-muted-foreground",
-                )}
-              >
-                {totalCount}
-              </span>
-            </button>
+            )}
 
-            <div className="pl-3 pt-0.5 space-y-0.5 min-w-0">
-              {domains.map(([domain, count]) => {
-                const isSelected = selectedDomain === domain;
-                return (
-                  <ContextMenu key={domain}>
+            {/* Connected phones */}
+            {devices.map((d) => {
+              const selected = sourceFilter === d.ip;
+              return (
+                <div key={d.serial} className="min-w-0">
+                  <ContextMenu>
                     <ContextMenuTrigger asChild>
-                      <button
-                        onClick={() =>
-                          onSelectDomain(isSelected ? null : domain)
-                        }
-                        className={cn(
-                          "flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left group min-w-0 overflow-hidden relative",
-                          isSelected
-                            ? "bg-primary text-primary-foreground"
-                            : "hover:bg-muted/50 text-foreground",
-                        )}
-                      >
-                        <Globe
-                          className={cn(
-                            "size-3.5 shrink-0",
-                            isSelected
-                              ? "text-primary-foreground/80"
-                              : "text-muted-foreground group-hover:text-foreground",
-                          )}
+                      <div>
+                        <SourceRow
+                          icon={<Smartphone className="size-3.5 shrink-0" />}
+                          label={d.model || "Android"}
+                          count={counts.byIp.get(d.ip) || 0}
+                          selected={selected}
+                          onSelect={() => onSelectSource(d.ip)}
+                          live
                         />
-
-                        <span className="truncate flex-1 min-w-0 font-mono text-[11px] font-normal leading-none tracking-tight pt-px pr-7">
-                          {domain}
-                        </span>
-                        <span
-                          className={cn(
-                            "absolute right-2 text-[10px] tabular-nums font-semibold shrink-0",
-                            isSelected
-                              ? "text-primary-foreground/80"
-                              : "text-muted-foreground",
-                          )}
-                        >
-                          {count}
-                        </span>
-                      </button>
+                      </div>
                     </ContextMenuTrigger>
-                    <ContextMenuContent className="text-[12px] min-w-40">
-                      <ContextMenuItem onClick={() => handleCopy(domain)}>
-                        Copy Domain
+                    <ContextMenuContent className="text-[12px] min-w-44">
+                      <ContextMenuItem onClick={() => handleCopy(d.ip)}>
+                        Copy IP ({d.ip})
+                      </ContextMenuItem>
+                      <ContextMenuItem onClick={() => onRemoveDevice(d.serial)}>
+                        Disconnect device
                       </ContextMenuItem>
                     </ContextMenuContent>
                   </ContextMenu>
-                );
-              })}
-
-              {domains.length === 0 && (
-                <div className="pl-2 py-2 text-muted-foreground text-[11px]">
-                  No requests
+                  {selected && (
+                    <DomainTree
+                      domains={domains}
+                      selectedDomain={selectedDomain}
+                      onSelectDomain={onSelectDomain}
+                      onCopy={handleCopy}
+                    />
+                  )}
                 </div>
-              )}
-            </div>
+              );
+            })}
+
+            {/* Add device */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button className="flex items-center gap-1.5 w-full px-2 py-1 mt-0.5 rounded-md text-left text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/70 hover:border-border min-w-0">
+                  <Plus className="size-3.5 shrink-0" />
+                  <span className="truncate">Add device</span>
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="min-w-44 text-[12px]"
+              >
+                <DropdownMenuItem onSelect={onAddDevice} className="gap-2">
+                  <Smartphone className="size-3.5" /> Android
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
       </ScrollArea>
+    </div>
+  );
+}
+
+function SourceRow({
+  icon,
+  label,
+  count,
+  selected,
+  onSelect,
+  live,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  count: number;
+  selected: boolean;
+  onSelect: () => void;
+  live?: boolean;
+}) {
+  return (
+    <button
+      onClick={onSelect}
+      className={cn(
+        "flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left group min-w-0 overflow-hidden",
+        selected
+          ? "bg-primary text-primary-foreground"
+          : "hover:bg-muted/50 text-foreground",
+      )}
+    >
+      <span
+        className={cn(
+          "shrink-0",
+          selected
+            ? "text-primary-foreground"
+            : "text-muted-foreground group-hover:text-foreground",
+        )}
+      >
+        {icon}
+      </span>
+      <span className="flex-1 truncate min-w-0">{label}</span>
+      {live && (
+        <span
+          className="size-1.5 rounded-full shrink-0"
+          style={{ background: LIVE }}
+          aria-label="live"
+        />
+      )}
+      <span
+        className={cn(
+          "text-[10px] tabular-nums font-semibold shrink-0",
+          selected ? "text-primary-foreground" : "text-muted-foreground",
+        )}
+      >
+        {count}
+      </span>
+    </button>
+  );
+}
+
+function DomainTree({
+  domains,
+  selectedDomain,
+  onSelectDomain,
+  onCopy,
+}: {
+  domains: [string, number][];
+  selectedDomain: string | null;
+  onSelectDomain: (domain: string | null) => void;
+  onCopy: (text: string) => void;
+}) {
+  if (domains.length === 0) {
+    return (
+      <div className="pl-7 py-1 text-muted-foreground text-[11px]">
+        No requests yet
+      </div>
+    );
+  }
+
+  // Domains sit directly under the source. Clicking one filters the table;
+  // clicking it again (or the source row) clears the filter — the list stays
+  // open either way.
+  return (
+    <div className="pl-6 pr-0.5 pt-0.5 pb-1 space-y-0.5 min-w-0">
+      {domains.map(([domain, count]) => {
+        const isSelected = selectedDomain === domain;
+        return (
+          <ContextMenu key={domain}>
+            <ContextMenuTrigger asChild>
+              <button
+                onClick={() => onSelectDomain(isSelected ? null : domain)}
+                className={cn(
+                  "flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left group min-w-0 overflow-hidden relative",
+                  isSelected
+                    ? "bg-primary text-primary-foreground"
+                    : "hover:bg-muted/50 text-foreground",
+                )}
+              >
+                <Globe
+                  className={cn(
+                    "size-3.5 shrink-0",
+                    isSelected
+                      ? "text-primary-foreground/80"
+                      : "text-muted-foreground group-hover:text-foreground",
+                  )}
+                />
+                <span className="truncate flex-1 min-w-0 font-mono text-[11px] font-normal leading-none tracking-tight pt-px pr-7">
+                  {domain}
+                </span>
+                <span
+                  className={cn(
+                    "absolute right-2 text-[10px] tabular-nums font-semibold shrink-0",
+                    isSelected
+                      ? "text-primary-foreground/80"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {count}
+                </span>
+              </button>
+            </ContextMenuTrigger>
+            <ContextMenuContent className="text-[12px] min-w-40">
+              <ContextMenuItem onClick={() => onCopy(domain)}>
+                Copy Domain
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
+        );
+      })}
     </div>
   );
 }

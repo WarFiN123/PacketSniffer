@@ -21,6 +21,7 @@ interface ToolbarProps {
   onOpenNetwork: () => void;
   onOpenBlockList: () => void;
   onOpenMap: () => void;
+  onOpenPatchApk: () => void;
   onOpenUpdate: () => void;
   onOpenAbout: () => void;
   onExportSession: () => void;
@@ -37,6 +38,7 @@ export default function Toolbar({
   onOpenNetwork,
   onOpenBlockList,
   onOpenMap,
+  onOpenPatchApk,
   onOpenUpdate,
   onOpenAbout,
   onExportSession,
@@ -135,6 +137,10 @@ export default function Toolbar({
                   Block / Allow List...
                 </MenubarItem>
                 <MenubarItem onClick={onOpenMap}>Map Requests...</MenubarItem>
+                <MenubarSeparator />
+                <MenubarItem onClick={onOpenPatchApk}>
+                  Patch an APK...
+                </MenubarItem>
               </MenubarContent>
             </MenubarMenu>
 

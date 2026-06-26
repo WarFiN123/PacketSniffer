@@ -27,8 +27,17 @@ import ErrorBoundary from "./components/ErrorBoundary";
 import NetworkSimDialog from "./components/NetworkSimDialog";
 import BlockListDialog from "./components/BlockListDialog";
 import MapRulesDialog from "./components/MapRulesDialog";
-import type { HttpSession } from "./types";
+import AddDeviceDialog from "./components/AddDeviceDialog";
+import PatchApkDialog from "./components/PatchApkDialog";
+import { LOCAL_SOURCE } from "./components/Sidebar";
+import type { ConnectedDevice, HttpSession } from "./types";
 import { DEFAULT_INTERCEPT, type InterceptConfig } from "./lib/intercept";
+
+/** Requests that arrived over loopback belong to "My computer"; a phone's
+ * arrive from its LAN IP. Mirrors `isLocalAddr` in Sidebar. */
+function isLocalAddr(addr?: string): boolean {
+  return !addr || addr === "::1" || addr === "localhost" || addr.startsWith("127.");
+}
 
 function matchesContentFilter(s: HttpSession, filter: ContentFilter): boolean {
   if (filter === "All") return true;
@@ -103,6 +112,36 @@ export default function App() {
   const [showPinnedOnly, setShowPinnedOnly] = useState(false);
   const [pinnedIds, setPinnedIds] = useState<Set<number>>(new Set());
 
+  // Traffic source: "My computer" (local) or a connected phone (its LAN IP).
+  const [sourceFilter, setSourceFilter] = useState<string>(LOCAL_SOURCE);
+  const [devices, setDevices] = useState<ConnectedDevice[]>([]);
+
+  const handleSelectSource = useCallback((source: string) => {
+    setSourceFilter(source);
+    setSelectedDomain(null);
+    setShowPinnedOnly(false);
+  }, []);
+
+  const handleConnected = useCallback((device: ConnectedDevice) => {
+    setDevices((prev) => {
+      const rest = prev.filter((d) => d.serial !== device.serial);
+      return [...rest, device];
+    });
+    handleSelectSource(device.ip);
+  }, [handleSelectSource]);
+
+  const handleRemoveDevice = useCallback(
+    (serial: string) => {
+      setDevices((prev) => {
+        const gone = prev.find((d) => d.serial === serial);
+        if (gone && gone.ip === sourceFilter) handleSelectSource(LOCAL_SOURCE);
+        invoke("stop_device_capture", { serial }).catch(() => {});
+        return prev.filter((d) => d.serial !== serial);
+      });
+    },
+    [sourceFilter, handleSelectSource],
+  );
+
   // Debounce text filter to avoid re-filtering on every keystroke
   useEffect(() => {
     const id = setTimeout(() => setDebouncedFilter(textFilter), 150);
@@ -131,6 +170,8 @@ export default function App() {
   const [networkOpen, setNetworkOpen] = useState(false);
   const [blockOpen, setBlockOpen] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
+  const [addDeviceOpen, setAddDeviceOpen] = useState(false);
+  const [patchApkOpen, setPatchApkOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
 
   // Interception rules (No-Cache, block/allow, map, throttle) — single source
@@ -244,6 +285,13 @@ export default function App() {
       const s = sessions.get(id);
       if (!s) return false;
 
+      // Source: "My computer" shows local traffic; a device shows only its IP.
+      const inSource =
+        sourceFilter === LOCAL_SOURCE
+          ? isLocalAddr(s.clientAddr)
+          : s.clientAddr === sourceFilter;
+      if (!inSource) return false;
+
       if (selectedDomain && s.host !== selectedDomain) return false;
 
       if (!matchesContentFilter(s, contentFilter)) return false;
@@ -272,6 +320,7 @@ export default function App() {
     selectedDomain,
     showPinnedOnly,
     pinnedIds,
+    sourceFilter,
   ]);
 
   const panelGroupRef = useRef<HTMLDivElement>(null);
@@ -309,6 +358,7 @@ export default function App() {
           onOpenNetwork={() => setNetworkOpen(true)}
           onOpenBlockList={() => setBlockOpen(true)}
           onOpenMap={() => setMapOpen(true)}
+          onOpenPatchApk={() => setPatchApkOpen(true)}
           onOpenUpdate={() => setUpdateOpen(true)}
           onOpenAbout={() => setAboutOpen(true)}
           onExportSession={handleExportSession}
@@ -334,6 +384,11 @@ export default function App() {
               <Sidebar
                 sessions={sessions}
                 order={order}
+                devices={devices}
+                sourceFilter={sourceFilter}
+                onSelectSource={handleSelectSource}
+                onAddDevice={() => setAddDeviceOpen(true)}
+                onRemoveDevice={handleRemoveDevice}
                 selectedDomain={selectedDomain}
                 onSelectDomain={(d) => {
                   setShowPinnedOnly(false);
@@ -429,6 +484,14 @@ export default function App() {
           config={intercept}
           onUpdate={updateIntercept}
         />
+
+        <AddDeviceDialog
+          open={addDeviceOpen}
+          onOpenChange={setAddDeviceOpen}
+          onConnected={handleConnected}
+        />
+
+        <PatchApkDialog open={patchApkOpen} onOpenChange={setPatchApkOpen} />
 
         <AboutDialog open={aboutOpen} onOpenChange={setAboutOpen} />
 

@@ -87,7 +87,7 @@ function ResizeHandle({
     <div
       onMouseDown={onMouseDown}
       onClick={(e) => e.stopPropagation()}
-      className="absolute top-0 -right-[3px] z-20 h-full w-1.5 cursor-col-resize select-none hover:bg-primary/50 active:bg-primary/70"
+      className="absolute top-0 -right-0.75 z-20 h-full w-1.5 cursor-col-resize select-none hover:bg-primary/50 active:bg-primary/70"
     />
   );
 }
@@ -137,19 +137,12 @@ const RequestRow = memo(function RequestRow({
         >
           <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary text-center border-r border-r-border/20 group-[.selected]:border-r-primary">
             <span
-              className={cn(
-                "inline-block w-2 h-2 rounded-full",
-                dotClass(s),
-              )}
+              className={cn("inline-block w-2 h-2 rounded-full", dotClass(s))}
             />
           </td>
 
           <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary text-center border-r border-r-border/20 group-[.selected]:border-r-primary">
-            {isPinned ? (
-              <span className="text-yellow-500">📌</span>
-            ) : (
-              ""
-            )}
+            {isPinned ? <span className="text-yellow-500">📌</span> : ""}
           </td>
 
           <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums">
@@ -160,9 +153,7 @@ const RequestRow = memo(function RequestRow({
             <span
               className={cn(
                 "font-medium",
-                isSelected
-                  ? "text-primary-foreground"
-                  : "text-foreground",
+                isSelected ? "text-primary-foreground" : "text-foreground",
               )}
             >
               {s.host}
@@ -198,17 +189,40 @@ const RequestRow = memo(function RequestRow({
 
           {/* Type */}
           <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary text-[11px] truncate">
-            {shortType(s.contentType) || (!s.complete ? <div className="flex items-center opacity-40 h-full"><Spinner size={10} /></div> : "")}
+            {shortType(s.contentType) ||
+              (!s.complete ? (
+                <div className="flex items-center opacity-40 h-full">
+                  <Spinner size={10} />
+                </div>
+              ) : (
+                ""
+              ))}
           </td>
 
           {/* Size */}
           <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums text-right whitespace-nowrap">
-            {s.responseSize ? formatSize(s.responseSize) : (!s.complete ? <div className="flex items-center justify-end opacity-40 h-full"><Spinner size={10} /></div> : "")}
+            {s.responseSize ? (
+              formatSize(s.responseSize)
+            ) : !s.complete ? (
+              <div className="flex items-center justify-end opacity-40 h-full">
+                <Spinner size={10} />
+              </div>
+            ) : (
+              ""
+            )}
           </td>
 
           {/* Duration */}
           <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums text-right whitespace-nowrap">
-            {s.duration ? formatTime(s.duration) : (!s.complete ? <div className="flex items-center justify-end opacity-40 h-full"><Spinner size={10} /></div> : "")}
+            {s.duration ? (
+              formatTime(s.duration)
+            ) : !s.complete ? (
+              <div className="flex items-center justify-end opacity-40 h-full">
+                <Spinner size={10} />
+              </div>
+            ) : (
+              ""
+            )}
           </td>
 
           {/* Filler — absorbs slack so the grid fills the pane */}
@@ -365,7 +379,10 @@ export default function RequestTable({
         >
           <colgroup>
             {COL_IDS.map((id) => (
-              <col key={id} style={{ width: widths[id] ?? DEFAULT_WIDTHS[id] }} />
+              <col
+                key={id}
+                style={{ width: widths[id] ?? DEFAULT_WIDTHS[id] }}
+              />
             ))}
             <col />
           </colgroup>
@@ -415,7 +432,10 @@ export default function RequestTable({
                 {/* Top spacer row for virtualization */}
                 {virtualItems.length > 0 && virtualItems[0].start > 0 && (
                   <tr>
-                    <td colSpan={COL_SPAN} style={{ height: virtualItems[0].start }} />
+                    <td
+                      colSpan={COL_SPAN}
+                      style={{ height: virtualItems[0].start }}
+                    />
                   </tr>
                 )}
 
@@ -447,7 +467,7 @@ export default function RequestTable({
                       style={{
                         height:
                           virtualizer.getTotalSize() -
-                          (virtualItems[virtualItems.length - 1].end),
+                          virtualItems[virtualItems.length - 1].end,
                       }}
                     />
                   </tr>

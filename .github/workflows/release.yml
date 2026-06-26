@@ -13,6 +13,12 @@ on:
           - minor
           - major
 
+# Never run two releases against the same ref at once; queue instead of cancel
+# so an in-flight publish is never killed mid-upload.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
@@ -21,7 +27,7 @@ jobs:
     outputs:
       tag_name: ${{ steps.bump.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ secrets.GH_RELEASER_TOKEN }}
@@ -39,10 +45,16 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      # Cargo registry index/cache only — no build artifacts here, so the full
+      # rust-cache action would be wasted weight. This just speeds `cargo update`.
+      - name: cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
 
       - name: Bump versions, commit, and tag
         id: bump
@@ -50,7 +62,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 1. Bump package.json (this also updates the version without tagging)
+          # 1. Bump package.json (updates the version without tagging)
           npm version ${{ github.event.inputs.bump }} --no-git-tag-version
           NEW_VERSION=$(node -p "require('./package.json').version")
 
@@ -62,9 +74,10 @@ jobs:
           # 3. Bump Cargo.toml
           sed -i "0,/^version = \".*\"/s/^version = \".*\"/version = \"$NEW_VERSION\"/" src-tauri/Cargo.toml
 
-          # 4. Update lockfiles
+          # 4. Refresh lockfiles. `cargo update -p` only rewrites the workspace
+          #    member's entry in Cargo.lock — no compile, no system GTK deps.
           bun install
-          (cd src-tauri && cargo check)
+          (cd src-tauri && cargo update -p packetsniffer)
 
           # 5. Commit and tag
           git add package.json bun.lock src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
@@ -97,7 +110,7 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare-release.outputs.tag_name }}
 
@@ -110,6 +123,10 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
+          # Both macOS targets run under the same job_id; without this suffix
+          # they'd clobber each other's cache. Keep one cache slot per target.
+          key: ${{ matrix.platform }}-${{ matrix.args }}
+          cache-on-failure: true
 
       - name: install dependencies (ubuntu only)
         if: matrix.platform == 'ubuntu-22.04'
@@ -122,8 +139,15 @@ jobs:
         with:
           bun-version: latest
 
+      - name: cache bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
       - name: install frontend dependencies
-        run: bun install
+        run: bun install --frozen-lockfile
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -145,7 +169,7 @@ jobs:
       # Remove signature files from the release
       - name: Remove signature files from release
         if: success()
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const owner = context.repo.owner;

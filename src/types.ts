@@ -5,6 +5,9 @@ export interface HttpHeader {
 
 export interface HttpSession {
   id: number;
+  /** IP the proxied request came from — "127.0.0.1" for this computer, a LAN IP
+   * for a connected phone. Used to separate "My computer" from each device. */
+  clientAddr: string;
   scheme: string;
   method: string;
   host: string;
@@ -34,6 +37,15 @@ export interface HttpSession {
 export interface SessionEvent {
   type: string; // "start" | "finish"
   session: HttpSession;
+}
+
+/** A phone connected through the "Add device" walkthrough. Its traffic is
+ * tagged by `ip` (the LAN address its proxied requests arrive from). */
+export interface ConnectedDevice {
+  serial: string;
+  model: string;
+  ip: string;
+  platform: "android";
 }
 
 export interface WsMessage {
