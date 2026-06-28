@@ -1061,6 +1061,21 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
     if opts.make_debuggable {
         patched = upsert_application_attr(&patched, "android:debuggable", "true")?;
     }
+    // apktool can decode a `<meta-data>` value it doesn't understand (some typed
+    // values, `@null`, refs into a split) as a name-only element. aapt2 then
+    // rebuilds it without a value, and Android's package parser rejects the APK
+    // (INSTALL_PARSE_FAILED_MANIFEST_MALFORMED: "<meta-data> requires an
+    // android:value or android:resource attribute"). Give any such orphan an
+    // empty value so the manifest parses; the original value was already lost in
+    // decode, so empty is no worse and unblocks install.
+    let (patched, repaired) = fix_orphan_meta_data(&patched);
+    if repaired > 0 {
+        warnings.push(format!(
+            "Repaired {repaired} <meta-data> element(s) that apktool decoded without a \
+             value (gave them android:value=\"\") so the APK installs. If the app reads \
+             one of these, its behavior may differ from the original."
+        ));
+    }
     std::fs::write(&manifest_path, patched).map_err(|e| format!("write manifest: {e}"))?;
 
     // Config-level pins are gone (we overwrote the nsc); warn about code pins.
@@ -1189,6 +1204,50 @@ fn upsert_application_attr(manifest: &str, attr: &str, value: &str) -> Result<St
         }
     }
     Err("Manifest has no editable <application> tag (self-closing or malformed)".to_string())
+}
+
+/// Add `android:value=""` to every `<meta-data>` tag that has neither
+/// `android:value` nor `android:resource` — the name-only shape apktool can
+/// emit for a value it failed to decode, which Android's parser rejects at
+/// install. Returns the patched manifest and the number of tags repaired.
+fn fix_orphan_meta_data(manifest: &str) -> (String, usize) {
+    let mut out = String::with_capacity(manifest.len());
+    let mut rest = manifest;
+    let mut repaired = 0;
+    while let Some(rel) = rest.find("<meta-data") {
+        // Copy through the start of the tag.
+        out.push_str(&rest[..rel]);
+        rest = &rest[rel..];
+        // Find this tag's closing '>'. apktool keeps each tag on one line, but a
+        // stray '>' can't appear inside the unquoted attribute area, so the first
+        // '>' is the tag end.
+        let Some(gt) = rest.find('>') else {
+            // Malformed tail — emit verbatim and stop.
+            out.push_str(rest);
+            rest = "";
+            break;
+        };
+        let tag = &rest[..=gt];
+        if !tag.contains("android:value") && !tag.contains("android:resource") {
+            // Insert before the self-closing '/' if present, else before '>'.
+            // Test the byte right before '>' so a '/' inside an attribute value
+            // (e.g. android:name="a/b") can't be mistaken for the tag's slash.
+            let insert_at = if gt > 0 && tag.as_bytes()[gt - 1] == b'/' {
+                gt - 1
+            } else {
+                gt
+            };
+            out.push_str(&tag[..insert_at]);
+            out.push_str(" android:value=\"\"");
+            out.push_str(&tag[insert_at..]);
+            repaired += 1;
+        } else {
+            out.push_str(tag);
+        }
+        rest = &rest[gt + 1..];
+    }
+    out.push_str(rest);
+    (out, repaired)
 }
 
 // ─── Frida gadget injection ───────────────────────────────────────────────────
