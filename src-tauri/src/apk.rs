@@ -262,6 +262,12 @@ fn adb_install(serial: &str, apks: &[PathBuf], replace: bool) -> Result<String, 
         cmd.arg("-r");
     }
     cmd.arg("-t");
+    // Spoof the installer package so apps that gate on install source
+    // (`getInstallerPackageName` / `getInstallSourceInfo`) believe they came from
+    // the Play Store instead of adb. Defeats the cheap "installed from Google
+    // Play?" check; cryptographic checks (Play Integrity) are unaffected — see
+    // patch_apk warnings, those need a Frida hook on the verdict.
+    cmd.args(["-i", "com.android.vending"]);
     for a in apks {
         cmd.arg(a);
     }
@@ -1206,10 +1212,15 @@ fn upsert_application_attr(manifest: &str, attr: &str, value: &str) -> Result<St
     Err("Manifest has no editable <application> tag (self-closing or malformed)".to_string())
 }
 
-/// Add `android:value=""` to every `<meta-data>` tag that has neither
-/// `android:value` nor `android:resource` — the name-only shape apktool can
-/// emit for a value it failed to decode, which Android's parser rejects at
-/// install. Returns the patched manifest and the number of tags repaired.
+/// Normalize every `<meta-data>` that Android's installer would reject for
+/// lacking a usable value. apktool 3.0.x can emit three bad shapes for a value
+/// it couldn't decode: name-only (no value/resource at all), or an explicit
+/// `android:value="@null"` / `android:resource="@null"`. aapt2 compiles the
+/// `@null` forms to a TYPE_NULL attribute, which the package parser treats as
+/// *missing* — same `INSTALL_PARSE_FAILED_MANIFEST_MALFORMED` as the name-only
+/// case. All three are rewritten to a present, empty `android:value=""`. The
+/// real value was already lost in decode, so empty is no worse and unblocks the
+/// install. Returns the patched manifest and the count of tags repaired.
 fn fix_orphan_meta_data(manifest: &str) -> (String, usize) {
     let mut out = String::with_capacity(manifest.len());
     let mut rest = manifest;
@@ -1228,8 +1239,23 @@ fn fix_orphan_meta_data(manifest: &str) -> (String, usize) {
             break;
         };
         let tag = &rest[..=gt];
-        if !tag.contains("android:value") && !tag.contains("android:resource") {
-            // Insert before the self-closing '/' if present, else before '>'.
+        rest = &rest[gt + 1..];
+
+        // Valid iff a value or resource is present and not "@null". An empty
+        // string (android:value="") is present, so it's fine — never re-touch it
+        // (that would duplicate the attribute).
+        if meta_attr_present(tag, "android:value") || meta_attr_present(tag, "android:resource") {
+            out.push_str(tag);
+            continue;
+        }
+        let new_tag = if tag.contains("android:value=\"@null\"") {
+            tag.replace("android:value=\"@null\"", "android:value=\"\"")
+        } else if tag.contains("android:resource=\"@null\"") {
+            // A null resource can't be made a real resource ref; downgrade to an
+            // empty value, which satisfies the parser.
+            tag.replace("android:resource=\"@null\"", "android:value=\"\"")
+        } else {
+            // Name-only: insert before the self-closing '/' if present, else '>'.
             // Test the byte right before '>' so a '/' inside an attribute value
             // (e.g. android:name="a/b") can't be mistaken for the tag's slash.
             let insert_at = if gt > 0 && tag.as_bytes()[gt - 1] == b'/' {
@@ -1237,17 +1263,71 @@ fn fix_orphan_meta_data(manifest: &str) -> (String, usize) {
             } else {
                 gt
             };
-            out.push_str(&tag[..insert_at]);
-            out.push_str(" android:value=\"\"");
-            out.push_str(&tag[insert_at..]);
-            repaired += 1;
-        } else {
-            out.push_str(tag);
-        }
-        rest = &rest[gt + 1..];
+            format!("{} android:value=\"\"{}", &tag[..insert_at], &tag[insert_at..])
+        };
+        out.push_str(&new_tag);
+        repaired += 1;
     }
     out.push_str(rest);
     (out, repaired)
+}
+
+/// True if `attr` appears on the tag with a real value — present and not the
+/// literal `@null` apktool writes for a null-decoded value. An empty string
+/// counts as present (the installer only requires the attribute to exist).
+fn meta_attr_present(tag: &str, attr: &str) -> bool {
+    let needle = format!("{attr}=\"");
+    let Some(s) = tag.find(&needle) else {
+        return false;
+    };
+    let s = s + needle.len();
+    let Some(e) = tag[s..].find('"') else {
+        return false;
+    };
+    &tag[s..s + e] != "@null"
+}
+
+#[cfg(test)]
+mod meta_data_tests {
+    use super::fix_orphan_meta_data;
+
+    #[test]
+    fn rewrites_null_resource() {
+        // The exact shape that broke net.cncapps.hackex2 at install (line #90).
+        let src = r#"<meta-data android:name="com.google.firebase.messaging.default_notification_icon" android:resource="@null"/>"#;
+        let (out, n) = fix_orphan_meta_data(src);
+        assert_eq!(n, 1);
+        assert!(out.contains(r#"android:value="""#), "got: {out}");
+        assert!(!out.contains("@null"), "got: {out}");
+    }
+
+    #[test]
+    fn rewrites_null_value_and_name_only() {
+        let src = concat!(
+            r#"<meta-data android:name="a" android:value="@null"/>"#,
+            "\n",
+            r#"<meta-data android:name="b"/>"#,
+        );
+        let (out, n) = fix_orphan_meta_data(src);
+        assert_eq!(n, 2);
+        assert!(!out.contains("@null"));
+        assert_eq!(out.matches(r#"android:value="""#).count(), 2, "got: {out}");
+    }
+
+    #[test]
+    fn leaves_valid_meta_data_untouched() {
+        let src = concat!(
+            r#"<meta-data android:name="x" android:value="com.foo.Bar"/>"#,
+            "\n",
+            r#"<meta-data android:name="y" android:resource="@xml/paths"/>"#,
+            "\n",
+            // Empty value is already present — must not be doubled.
+            r#"<meta-data android:name="z" android:value=""/>"#,
+        );
+        let (out, n) = fix_orphan_meta_data(src);
+        assert_eq!(n, 0);
+        assert_eq!(out, src);
+    }
 }
 
 // ─── Frida gadget injection ───────────────────────────────────────────────────
