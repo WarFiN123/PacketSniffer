@@ -96,11 +96,7 @@ pub fn check_apk_tools() -> Vec<String> {
 fn tool_on_path(bin: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("where")
-            .arg(bin)
-            .creation_flags(CREATE_NO_WINDOW)
+        no_window(Command::new("where").arg(bin))
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -497,27 +493,26 @@ fn platform_install_patch(app: &AppHandle, missing: &[String]) -> Result<String,
 fn platform_install_patch(app: &AppHandle, missing: &[String]) -> Result<String, String> {
     let mut done: Vec<&str> = Vec::new();
     let mut manual: Vec<&str> = Vec::new();
-    let has_winget = Command::new("winget").arg("--version").output().is_ok();
+    let has_winget = no_window(Command::new("winget").arg("--version")).output().is_ok();
 
     if missing.iter().any(|t| t == "java" || t == "keytool") {
         if has_winget {
             tools_progress(app, "install", "Installing OpenJDK via winget…");
             // Pin `--source winget`: a broken msstore source otherwise makes
             // winget bail with "specify one of them using --source".
-            let _ = Command::new("winget")
-                .args([
-                    "install", "-e", "--id", "Microsoft.OpenJDK.17",
-                    "--source", "winget", "--silent",
-                    "--accept-source-agreements", "--accept-package-agreements",
-                ])
-                .status();
+            let _ = no_window(Command::new("winget").args([
+                "install", "-e", "--id", "Microsoft.OpenJDK.17",
+                "--source", "winget", "--silent",
+                "--accept-source-agreements", "--accept-package-agreements",
+            ]))
+            .status();
             // The installer updates machine PATH, but our process won't see it
             // until restart — add the JDK's bin dir to PATH now.
             add_winget_jdk_to_path();
         }
         // Judge by whether java actually resolves, not winget's exit code
         // (it returns non-zero for "already installed" and other benign cases).
-        if Command::new("java").arg("-version").output().is_ok() {
+        if no_window(Command::new("java").arg("-version")).output().is_ok() {
             done.push("java/keytool");
         } else {
             manual.push("java");
@@ -667,13 +662,16 @@ pub fn device_reverse_setup(serial: &str, port: u16) -> Result<(), String> {
 /// remove the reverse tunnel. Called on disconnect so we don't strand the phone
 /// behind a dead proxy ("limited connection").
 pub fn device_reverse_teardown(serial: &str, port: u16) {
-    let _ = Command::new("adb")
-        .args(["-s", serial, "shell", "settings", "put", "global", "http_proxy", ":0"])
-        .output();
+    let _ = no_window(
+        Command::new("adb")
+            .args(["-s", serial, "shell", "settings", "put", "global", "http_proxy", ":0"]),
+    )
+    .output();
     let tcp = format!("tcp:{port}");
-    let _ = Command::new("adb")
-        .args(["-s", serial, "reverse", "--remove", tcp.as_str()])
-        .output();
+    let _ = no_window(
+        Command::new("adb").args(["-s", serial, "reverse", "--remove", tcp.as_str()]),
+    )
+    .output();
 }
 
 fn download_platform_tools(app: &AppHandle) -> Result<String, String> {
@@ -771,16 +769,12 @@ pub fn register_bundled_tools() {
 /// genuinely on PATH still reads as "missing" until we refresh.
 #[cfg(target_os = "windows")]
 fn refresh_windows_path() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "[Environment]::ExpandEnvironmentVariables((@([Environment]::GetEnvironmentVariable('Path','Machine'),[Environment]::GetEnvironmentVariable('Path','User')) -join ';'))",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
+    let out = no_window(Command::new("powershell").args([
+        "-NoProfile",
+        "-Command",
+        "[Environment]::ExpandEnvironmentVariables((@([Environment]::GetEnvironmentVariable('Path','Machine'),[Environment]::GetEnvironmentVariable('Path','User')) -join ';'))",
+    ]))
+    .output();
     let reg_path = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => return,
@@ -1591,6 +1585,7 @@ fn tool(bin: &str) -> Command {
     {
         let mut c = Command::new("cmd");
         c.arg("/C").arg(bin);
+        no_window(&mut c);
         c
     }
     #[cfg(not(target_os = "windows"))]
@@ -1599,11 +1594,26 @@ fn tool(bin: &str) -> Command {
     }
 }
 
+/// Windows: suppress the console window that would otherwise flash every time we
+/// spawn a child console process (adb, curl, cmd, powershell). No-op elsewhere.
+/// Every external command MUST go through this — the Add-Device dialog polls
+/// `adb devices` every 2s, so an unflagged spawn shows a cmd-window loop once
+/// adb resolves. Prefer this over duplicating the flag at each call site.
+fn no_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Run a command, returning stdout on success or a stderr-derived error.
 /// All arguments are passed as an argv array (no shell), so device serials and
 /// package names cannot inject extra commands.
 fn run(cmd: &mut Command, ctx: &str) -> Result<String, String> {
-    let out = cmd
+    let out = no_window(cmd)
         .output()
         .map_err(|e| format!("{ctx}: failed to launch ({e}) — is it installed and on PATH?"))?;
     if out.status.success() {
