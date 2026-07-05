@@ -16,6 +16,8 @@ bun run vite:dev  # Frontend only (no Tauri shell)
 
 Rust backend only: `cd src-tauri && cargo build` / `cargo check`.
 
+No test suite or lint script configured (`package.json` has no `test`/`lint` entry; no `#[cfg(test)]` modules in `src-tauri/src`). Use `cargo check` / `bun run vite:build` (runs `tsc`) to catch type errors.
+
 ## Architecture
 
 ### IPC Contract
@@ -52,6 +54,7 @@ Bounded at `MAX_SESSIONS = 5000` (defined in `lib.rs` and mirrored in `useTauriE
 | `src-tauri/src/proxy/intercept.rs` | Process-global intercept rules (RwLock) |
 | `src-tauri/src/system_proxy.rs` | OS proxy registry (Windows/macOS/Linux) |
 | `src-tauri/src/cert_store.rs` | OS trust store check + CA install |
+| `src-tauri/src/apk.rs` | Android MITM: repatches APKs (apktool) to trust the proxy CA via injected `network_security_config.xml`, re-signs (zipalign/apksigner); requires java/keytool/apktool/zipalign/apksigner/adb on PATH |
 | `src/App.tsx` | Root layout, top-level state |
 | `src/hooks/useTauriEvents.ts` | Event batching, session map, WS message map |
 | `src/types.ts` | Shared TS interfaces |
