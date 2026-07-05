@@ -1083,7 +1083,7 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
     // 1. Decode --------------------------------------------------------------
     progress(app, "decode", "Decompiling APK with apktool…");
     let _ = std::fs::remove_dir_all(&decode_dir); // -f also forces, this is belt-and-suspenders
-    run(
+    run_expect(
         tool("apktool")
             .arg("d")
             .arg("-f")
@@ -1091,6 +1091,7 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
             .arg(&decode_dir)
             .arg(&apk),
         "apktool decode",
+        &decode_dir.join("apktool.yml"), // written only on a successful decode
     )?;
 
     // 2. Network security config + embedded CA -------------------------------
@@ -1199,15 +1200,52 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
 
     // 4. Rebuild -------------------------------------------------------------
     progress(app, "build", "Rebuilding APK…");
-    let _ = std::fs::remove_file(&built);
-    run(
-        tool("apktool")
-            .arg("b")
-            .arg("-o")
-            .arg(&built)
-            .arg(&decode_dir),
-        "apktool build",
-    )?;
+    // `-j 1`: assemble the dex files one at a time. The Windows `apktool.bat`
+    // wrapper hardcodes the JVM at `-Xmx1024M`, and apktool otherwise smalis every
+    // `smali_classesN` folder in parallel (one thread per core). On a large
+    // multi-dex app (Wynk has 10 dex) the concurrent smali trees blow past 1 GB and
+    // the build dies with `OutOfMemoryError: Java heap space`. Serializing caps peak
+    // heap to a single dex so it fits; the cost is wall-time on big apps.
+    //
+    // Retry loop: a rebuild can also die because aapt2 won't re-link a resource
+    // value apktool decoded but can't re-encode (a flags/enum attr set to 0, see
+    // repair_incompatible_res_attrs). Strip exactly the attributes aapt2 names and
+    // rebuild — apktool re-links the edited resources without a cache wipe, so the
+    // retry only re-links (smali stays cached). Bounded so an unrepairable error
+    // surfaces instead of looping.
+    let mut last_err = String::new();
+    let mut built_ok = false;
+    for _ in 0..3 {
+        let _ = std::fs::remove_file(&built);
+        match run_expect(
+            tool("apktool")
+                .arg("b")
+                .args(["-j", "1"])
+                .arg("-o")
+                .arg(&built)
+                .arg(&decode_dir),
+            "apktool build",
+            &built,
+        ) {
+            Ok(_) => {
+                built_ok = true;
+                break;
+            }
+            Err(e) => last_err = e,
+        }
+        let removed = repair_incompatible_res_attrs(&decode_dir, &last_err);
+        if removed == 0 {
+            break; // not the resource-incompatibility class — report the real error
+        }
+        warnings.push(format!(
+            "Removed {removed} resource attribute(s) that aapt2 could not re-link — a \
+             flags/enum attribute with a zero value that apktool decoded as \"0x0\". \
+             They are inert unless the view uses them, but rendering may differ slightly."
+        ));
+    }
+    if !built_ok {
+        return Err(last_err);
+    }
 
     // 5. Align ---------------------------------------------------------------
     progress(app, "align", "Aligning…");
@@ -1424,6 +1462,170 @@ fn meta_attr_present(tag: &str, attr: &str) -> bool {
         return false;
     };
     &tag[s..s + e] != "@null"
+}
+
+/// Remove every `<ns>:<attr>="<value>"` occurrence (e.g. `android:foregroundGravity="0x0"`)
+/// from `xml`, along with one leading space so no double space is left. The match
+/// must sit on an attribute boundary — the char before it is `:` (namespaced),
+/// whitespace, or start-of-string — so a short `attr` can't clip a longer name
+/// (`gravity` must not match `foregroundGravity`). Returns the text and how many
+/// were removed.
+fn strip_res_attr(xml: &str, attr: &str, value: &str) -> (String, usize) {
+    let tail = format!("{attr}=\"{value}\"");
+    let bytes = xml.as_bytes();
+    let mut out = String::with_capacity(xml.len());
+    let mut search_from = 0;
+    let mut copied_to = 0;
+    let mut removed = 0;
+    while let Some(rel) = xml[search_from..].find(&tail) {
+        let pos = search_from + rel;
+        let prev = pos.checked_sub(1).map(|i| bytes[i]);
+        let on_boundary = matches!(prev, None)
+            || matches!(prev, Some(b) if b == b':' || b.is_ascii_whitespace());
+        if !on_boundary {
+            // `attr` is the suffix of a longer attribute name — not a real match.
+            search_from = pos + tail.len();
+            continue;
+        }
+        // Extend the cut left over an optional `ns:` prefix, then one leading space.
+        let mut cut = pos;
+        if prev == Some(b':') {
+            cut -= 1; // the ':'
+            while cut > 0 {
+                let c = bytes[cut - 1];
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+                    cut -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if cut > 0 && bytes[cut - 1].is_ascii_whitespace() {
+            cut -= 1;
+        }
+        out.push_str(&xml[copied_to..cut]);
+        let end = pos + tail.len();
+        copied_to = end;
+        search_from = end;
+        removed += 1;
+    }
+    out.push_str(&xml[copied_to..]);
+    (out, removed)
+}
+
+/// Auto-repair the one apktool-rebuild failure that a resource *value* causes:
+/// aapt2 refusing to re-link a flags/enum attribute whose value has no matching
+/// entry. The classic case is a gravity attribute set to 0 — apktool 3.0.x decodes
+/// it as the literal `0x0`, and since no flag/enum entry equals 0 aapt2 rejects
+/// both `0x0` and `0`. aapt2 names each offender:
+/// `W: <file>:<line>: error: '<value>' is incompatible with attribute <attr> (attr) …`.
+/// Strip exactly those attributes (inert unless the view actually draws a
+/// foreground / uses the flag) so the retry links. Only files inside `decode_dir`
+/// are touched. Returns the number of attributes removed (0 ⇒ nothing we recognize,
+/// so the caller should surface the real error instead of looping).
+fn repair_incompatible_res_attrs(decode_dir: &Path, build_err: &str) -> usize {
+    const MARKER: &str = " is incompatible with attribute ";
+    const VAL: &str = "error: '";
+    let mut targets: Vec<(PathBuf, String, String)> = Vec::new();
+    for line in build_err.lines() {
+        let (Some(m), Some(e)) = (line.find(MARKER), line.find(VAL)) else {
+            continue;
+        };
+        let vs = e + VAL.len();
+        let Some(vrel) = line[vs..].find('\'') else { continue };
+        let value = line[vs..vs + vrel].to_string();
+        let as_ = m + MARKER.len();
+        let Some(arel) = line[as_..].find(" (attr)") else { continue };
+        let attr = line[as_..as_ + arel].trim().to_string();
+        // Prefix is `W: <path>:<line>:` — the last ':' splits off the line number.
+        let prefix = line[..e].trim_end();
+        let prefix = prefix.strip_suffix(':').unwrap_or(prefix);
+        let Some((path_part, _line_no)) = prefix.rsplit_once(':') else { continue };
+        let path_str = ["W: ", "E: ", "I: "]
+            .iter()
+            .find_map(|p| path_part.strip_prefix(p))
+            .unwrap_or(path_part)
+            .trim();
+        let path = PathBuf::from(path_str);
+        if attr.is_empty() || !path.starts_with(decode_dir) {
+            continue; // never edit outside the decoded tree
+        }
+        let tup = (path, attr, value);
+        if !targets.contains(&tup) {
+            targets.push(tup);
+        }
+    }
+    let mut removed = 0;
+    let mut done: Vec<&PathBuf> = Vec::new();
+    for (file, _, _) in &targets {
+        if done.contains(&file) {
+            continue;
+        }
+        done.push(file);
+        let Ok(content) = std::fs::read_to_string(file) else { continue };
+        let mut cur = content;
+        for (p, attr, value) in &targets {
+            if p == file {
+                let (next, n) = strip_res_attr(&cur, attr, value);
+                cur = next;
+                removed += n;
+            }
+        }
+        let _ = std::fs::write(file, cur);
+    }
+    removed
+}
+
+#[cfg(test)]
+mod res_repair_tests {
+    use super::{repair_incompatible_res_attrs, strip_res_attr};
+
+    #[test]
+    fn strips_namespaced_attr_and_its_leading_space() {
+        let xml = r#"<View android:maxLines="1" android:foregroundGravity="0x0" app:x="1"/>"#;
+        let (out, n) = strip_res_attr(xml, "foregroundGravity", "0x0");
+        assert_eq!(n, 1);
+        assert_eq!(out, r#"<View android:maxLines="1" app:x="1"/>"#);
+    }
+
+    #[test]
+    fn does_not_clip_a_longer_attr_name() {
+        // `gravity` must not match inside `foregroundGravity`.
+        let xml = r#"<View android:foregroundGravity="0x0"/>"#;
+        let (out, n) = strip_res_attr(xml, "gravity", "0x0");
+        assert_eq!(n, 0);
+        assert_eq!(out, xml);
+    }
+
+    #[test]
+    fn strips_every_occurrence() {
+        let xml = r#"<A android:gravity="0x0"/><B android:gravity="0x0"/>"#;
+        let (out, n) = strip_res_attr(xml, "gravity", "0x0");
+        assert_eq!(n, 2);
+        assert_eq!(out, "<A/><B/>");
+    }
+
+    #[test]
+    fn repair_parses_aapt2_errors_and_ignores_paths_outside_the_tree() {
+        let dir = std::env::temp_dir().join(format!("psniff_res_repair_{}", std::process::id()));
+        let layout = dir.join("res").join("layout");
+        std::fs::create_dir_all(&layout).unwrap();
+        let f = layout.join("widget.xml");
+        std::fs::write(&f, r#"<T android:maxLines="1" android:foregroundGravity="0x0"/>"#).unwrap();
+        // Second line points outside `dir` and must be ignored (path traversal guard).
+        let err = format!(
+            "W: {}:1: error: '0x0' is incompatible with attribute foregroundGravity (attr) flags [top=48].\n\
+             W: /elsewhere/evil.xml:1: error: '0x0' is incompatible with attribute gravity (attr) flags [x=1].",
+            f.display()
+        );
+        let removed = repair_incompatible_res_attrs(&dir, &err);
+        assert_eq!(removed, 1);
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            r#"<T android:maxLines="1"/>"#
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -2192,5 +2394,47 @@ fn run(cmd: &mut Command, ctx: &str) -> Result<String, String> {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let detail = if stderr.trim().is_empty() { stdout } else { stderr };
         Err(format!("{ctx} failed: {}", detail.trim()))
+    }
+}
+
+/// Run a step and treat a missing `expected` artifact as failure — even when the
+/// process reports success. The Windows `apktool.bat` wrapper ends with
+/// `pause & exit /b`, so when launched as `cmd /C apktool …` (see [`tool`]) it
+/// discards the Java exit code and returns 0 whether the decode/build actually
+/// worked or not. Trusting that status lets a failed apktool step slip through and
+/// resurface as a baffling downstream error (e.g. `zipalign: … No such file or
+/// directory` when `-built.apk` was never written). Anchoring on the real artifact
+/// is wrapper-agnostic and surfaces apktool's own output for diagnosis.
+fn run_expect(cmd: &mut Command, ctx: &str, expected: &Path) -> Result<String, String> {
+    let out = no_window(cmd)
+        .output()
+        .map_err(|e| format!("{ctx}: failed to launch ({e}) — is it installed and on PATH?"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if expected.exists() {
+        // Produced the artifact — good, even if a wrapper returned a noisy exit code.
+        return Ok(stdout.to_string());
+    }
+    let mut detail = String::new();
+    for s in [stderr.trim(), stdout.trim()] {
+        if s.is_empty() {
+            continue;
+        }
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str(s);
+    }
+    if detail.is_empty() {
+        detail.push_str("(no output)");
+    }
+    if out.status.success() {
+        Err(format!(
+            "{ctx} reported success but did not produce {} — the step failed and its \
+             wrapper masked the exit code. Tool output:\n{detail}",
+            expected.display(),
+        ))
+    } else {
+        Err(format!("{ctx} failed: {detail}"))
     }
 }
