@@ -12,6 +12,12 @@ import {
   MenubarTrigger,
 } from "@/components/ui/menubar";
 import WindowControls from "./WindowControls";
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+} from "@/components/ui/input-group";
+import { Kbd } from "@/components/ui/kbd";
 
 interface ToolbarProps {
   connected: boolean;
@@ -48,10 +54,13 @@ export default function Toolbar({
 }: ToolbarProps) {
   const searchRef = useRef<HTMLInputElement>(null);
 
-  // Ctrl/Cmd+F focuses the app's own filter instead of the webview's find bar.
+  // Ctrl/Cmd+K (the advertised shortcut) and Ctrl/Cmd+F both focus the app's
+  // own filter instead of the webview's find bar.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && (e.key === "f" || e.key === "F")) {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const key = e.key.toLowerCase();
+      if (key === "k" || key === "f") {
         e.preventDefault();
         searchRef.current?.focus();
         searchRef.current?.select();
@@ -89,8 +98,11 @@ export default function Toolbar({
       data-tauri-drag-region
       onMouseDown={handleMouseDown}
     >
-      {/* Top row: Menu bar + Window controls area (macOS style space or Windows controls space depending on OS) */}
-      <div className="flex items-center justify-between h-9 px-2 gap-2" data-tauri-drag-region>
+      {/* Top row: Menu bar + Window controls area */}
+      <div
+        className="flex items-center justify-between h-9 px-2 gap-2"
+        data-tauri-drag-region
+      >
         <div className="flex items-center gap-2" data-tauri-drag-region>
           {/* Logo / Brand */}
           <div className="font-bold text-sm px-2 text-primary tracking-tight flex items-center gap-1.5 font-chakra pointer-events-none">
@@ -157,6 +169,7 @@ export default function Toolbar({
                   <a
                     href="https://github.com/WarFiN123/packetsniffer"
                     target="_blank"
+                    rel="noreferrer"
                   >
                     Report an Issue
                   </a>
@@ -175,10 +188,9 @@ export default function Toolbar({
         </div>
 
         {/* Right cluster: filter + window controls */}
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1.5 bg-muted/50 border border-border rounded-md px-2 h-6 min-w-50 group focus-within:ring-1 focus-within:ring-ring z-10">
-            <Search className="size-3.5 text-muted-foreground group-focus-within:text-primary" />
-            <input
+        <div className="flex items-center">
+          <InputGroup className="h-6 max-w-sm rounded-lg transition-shadow focus-within:ring-2 focus-within:ring-ring/50">
+            <InputGroupInput
               ref={searchRef}
               type="text"
               value={textFilter}
@@ -186,22 +198,18 @@ export default function Toolbar({
               onKeyDown={(e) => {
                 if (e.key === "Escape") {
                   if (textFilter) onTextChange("");
-                  e.currentTarget.blur();
+                  else searchRef.current?.blur();
                 }
               }}
-              placeholder="Filter (Ctrl + F)"
-              className="bg-transparent text-[11px] text-foreground placeholder:text-muted-foreground outline-none flex-1 min-w-0 font-medium"
+              placeholder="Filter"
             />
-            {textFilter && (
-              <button
-                onClick={() => onTextChange("")}
-                className="text-muted-foreground hover:text-foreground text-xs leading-none shrink-0"
-              >
-                <X className="size-3.5" />
-              </button>
-            )}
-          </div>
-
+            <InputGroupAddon className="pl-1.5">
+              <Search className="text-muted-foreground" />
+            </InputGroupAddon>
+            <InputGroupAddon align={"inline-end"}>
+              <Kbd>⌘K</Kbd>
+            </InputGroupAddon>
+          </InputGroup>
           <WindowControls onClose={handleQuit} />
         </div>
       </div>

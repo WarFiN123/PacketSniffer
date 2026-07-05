@@ -13,13 +13,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import Spinner from "./Spinner";
 import PatchOptions, {
   type PatchOpts,
@@ -37,6 +30,7 @@ import {
   TriangleAlert,
   RefreshCw,
   Copy,
+  Search,
 } from "lucide-react";
 
 interface Props {
@@ -65,6 +59,152 @@ interface StageDef {
   key: string;
   code: string;
   label: string;
+}
+
+/** Type-to-filter app picker. A device can list hundreds of packages, so a
+ *  free-text input that narrows the list beats scrolling a dropdown. The
+ *  committed `value` is only ever a real package name (empty until one is
+ *  picked), so callers can trust it directly. */
+function PackageCombobox({
+  packages,
+  value,
+  onChange,
+  disabled,
+  loading,
+}: {
+  packages: DevicePackage[];
+  value: string;
+  onChange: (pkg: string) => void;
+  disabled?: boolean;
+  loading?: boolean;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  // Clear the typed query whenever the app set is (re)loaded.
+  useEffect(() => {
+    setQuery("");
+  }, [packages]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const list = q
+      ? packages.filter((p) => p.package.toLowerCase().includes(q))
+      : packages;
+    return list.slice(0, 200); // cap the rendered rows for big device lists
+  }, [packages, query]);
+
+  // Close when clicking outside the control.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // Keep the highlighted row in view while arrowing through the list.
+  useEffect(() => {
+    if (!open) return;
+    listRef.current
+      ?.querySelector<HTMLElement>('[data-active="true"]')
+      ?.scrollIntoView({ block: "nearest" });
+  }, [active, open]);
+
+  // A partial or unknown string isn't a valid target, so commit "" until the
+  // text is an exact package name.
+  const commit = (val: string) =>
+    onChange(packages.some((p) => p.package === val) ? val : "");
+
+  const select = (pkg: string) => {
+    setQuery(pkg);
+    onChange(pkg);
+    setOpen(false);
+  };
+
+  return (
+    <div ref={rootRef} className="relative flex-1">
+      <Search className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground" />
+      <input
+        value={query}
+        disabled={disabled}
+        spellCheck={false}
+        autoComplete="off"
+        placeholder={loading ? "Loading apps…" : "Search apps by package name"}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setActive(0);
+          setOpen(true);
+          commit(e.target.value);
+        }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setOpen(true);
+            setActive((i) => Math.min(i + 1, filtered.length - 1));
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setActive((i) => Math.max(i - 1, 0));
+          } else if (e.key === "Enter") {
+            if (open && filtered[active]) {
+              e.preventDefault();
+              select(filtered[active].package);
+            }
+          } else if (e.key === "Escape") {
+            if (open) {
+              e.preventDefault();
+              setOpen(false);
+            }
+          }
+        }}
+        className="w-full h-8 rounded-md border border-border/60 bg-bg-2/30 pl-8 pr-8 text-sm font-mono text-text-0 outline-none transition-colors placeholder:font-sans placeholder:text-muted-foreground focus:border-foreground/50 focus:ring-1 focus:ring-ring/40 disabled:opacity-50"
+      />
+      {value && !open && (
+        <Check className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 size-3.5 text-text-0" />
+      )}
+      {open && !disabled && (
+        <div
+          ref={listRef}
+          className="absolute z-50 mt-1 max-h-64 w-full overflow-auto rounded-md border border-border bg-bg-1 py-1 shadow-lg"
+        >
+          {filtered.length === 0 ? (
+            <div className="px-3 py-2 text-[11px] text-muted-foreground">
+              {loading
+                ? "Loading apps…"
+                : packages.length === 0
+                  ? "No apps found on device."
+                  : "No apps match your search."}
+            </div>
+          ) : (
+            filtered.map((p, i) => (
+              <button
+                key={p.package}
+                type="button"
+                data-active={i === active}
+                onMouseEnter={() => setActive(i)}
+                onClick={() => select(p.package)}
+                className={`flex w-full items-center gap-2 px-3 py-1.5 text-left font-mono text-[12px] transition-colors ${
+                  i === active ? "bg-bg-2 text-text-0" : "text-text-1"
+                }`}
+              >
+                <Check
+                  className={`size-3 shrink-0 ${
+                    p.package === value ? "text-text-0" : "opacity-0"
+                  }`}
+                />
+                <span className="truncate">{p.package}</span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
@@ -389,24 +529,13 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
                       {protection?.pairip && <PairipChip />}
                     </Label>
                     <div className="flex items-center gap-2">
-                      <Select
+                      <PackageCombobox
+                        packages={packages}
                         value={pkg}
-                        onValueChange={setPkg}
-                        disabled={!serial || pkgLoading}
-                      >
-                        <SelectTrigger className="h-8 text-sm flex-1">
-                          <SelectValue placeholder="Select app" />
-                        </SelectTrigger>
-                        <SelectContent className="max-h-72">
-                          {packages.map((p) => (
-                            <SelectItem key={p.package} value={p.package}>
-                              <span className="font-mono text-[12px]">
-                                {p.package}
-                              </span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                        onChange={setPkg}
+                        disabled={!serial}
+                        loading={pkgLoading}
+                      />
                       <Button
                         variant="outline"
                         size="xs"

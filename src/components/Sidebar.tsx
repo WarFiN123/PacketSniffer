@@ -108,17 +108,20 @@ export default function Sidebar({
             <button
               onClick={onTogglePinned}
               className={cn(
-                "flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left min-w-0 overflow-hidden",
+                "relative flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left min-w-0 overflow-hidden",
                 showPinnedOnly
-                  ? "bg-primary text-primary-foreground"
+                  ? "bg-select text-select-fg font-semibold"
                   : "hover:bg-muted/50 text-foreground",
               )}
             >
+              {showPinnedOnly && (
+                <span className="absolute left-0 top-1 bottom-1 w-0.5 rounded-full bg-foreground" />
+              )}
               <Pin
                 className={cn(
                   "size-3.5 shrink-0",
                   showPinnedOnly
-                    ? "text-primary-foreground/80"
+                    ? "text-select-fg/80"
                     : "text-muted-foreground",
                 )}
               />
@@ -127,7 +130,7 @@ export default function Sidebar({
                 className={cn(
                   "text-[10px] tabular-nums font-semibold shrink-0",
                   showPinnedOnly
-                    ? "text-primary-foreground"
+                    ? "text-select-fg"
                     : "text-muted-foreground",
                 )}
               >
@@ -247,17 +250,20 @@ function SourceRow({
     <button
       onClick={onSelect}
       className={cn(
-        "flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left group min-w-0 overflow-hidden",
+        "relative flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left group min-w-0 overflow-hidden",
         selected
-          ? "bg-primary text-primary-foreground"
+          ? "bg-select text-select-fg font-semibold"
           : "hover:bg-muted/50 text-foreground",
       )}
     >
+      {selected && (
+        <span className="absolute left-0 top-1 bottom-1 w-0.5 rounded-full bg-foreground" />
+      )}
       <span
         className={cn(
           "shrink-0",
           selected
-            ? "text-primary-foreground"
+            ? "text-select-fg"
             : "text-muted-foreground group-hover:text-foreground",
         )}
       >
@@ -274,7 +280,7 @@ function SourceRow({
       <span
         className={cn(
           "text-[10px] tabular-nums font-semibold shrink-0",
-          selected ? "text-primary-foreground" : "text-muted-foreground",
+          selected ? "text-select-fg" : "text-muted-foreground",
         )}
       >
         {count}
@@ -318,15 +324,18 @@ function DomainTree({
                 className={cn(
                   "flex items-center gap-1.5 w-full px-2 py-1 rounded-md text-left group min-w-0 overflow-hidden relative",
                   isSelected
-                    ? "bg-primary text-primary-foreground"
+                    ? "bg-select text-select-fg"
                     : "hover:bg-muted/50 text-foreground",
                 )}
               >
+                {isSelected && (
+                  <span className="absolute left-0 top-1 bottom-1 w-0.5 rounded-full bg-foreground" />
+                )}
                 <Globe
                   className={cn(
                     "size-3.5 shrink-0",
                     isSelected
-                      ? "text-primary-foreground/80"
+                      ? "text-select-fg/80"
                       : "text-muted-foreground group-hover:text-foreground",
                   )}
                 />
@@ -337,7 +346,7 @@ function DomainTree({
                   className={cn(
                     "absolute right-2 text-[10px] tabular-nums font-semibold shrink-0",
                     isSelected
-                      ? "text-primary-foreground/80"
+                      ? "text-select-fg/80"
                       : "text-muted-foreground",
                   )}
                 >

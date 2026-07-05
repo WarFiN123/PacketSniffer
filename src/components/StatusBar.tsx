@@ -115,32 +115,32 @@ export default function StatusBar({
       </div>
 
       {/* Right side items */}
-      <div className="flex items-center justify-end gap-2 text-muted-foreground font-medium tabular-nums min-w-[200px]">
+      <div className="flex items-center justify-end gap-2 text-muted-foreground font-medium tabular-nums min-w-50">
         {/* Status Pill with Dropdown Menu */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
               variant="ghost"
               size="xs"
-              className="h-6 px-2.5 rounded-full border border-border/50 bg-muted/30 hover:bg-muted/60 text-[11px] font-medium text-foreground shadow-sm transition-colors cursor-pointer"
+              className="h-6 border border-border/50 bg-muted/30 hover:bg-muted/60 text-[11px] font-medium text-foreground shadow-sm transition-colors cursor-pointer"
             >
               <div className="flex items-center">
                 {connected ? (
                   recording ? (
-                    <span className="w-2 h-2 rounded-full bg-green-500 mr-2 shadow-[0_0_4px_rgba(34,197,94,0.5)] animate-pulse" />
+                    <span className="w-2 h-2 rounded-full bg-green-500 mr-1 shadow-[0_0_4px_rgba(34,197,94,0.5)]" />
                   ) : (
-                    <span className="w-2 h-2 rounded-full bg-yellow-500 mr-2 shadow-[0_0_4px_rgba(234,179,8,0.5)]" />
+                    <span className="w-2 h-2 rounded-full bg-yellow-500 mr-1 shadow-[0_0_4px_rgba(234,179,8,0.5)]" />
                   )
                 ) : (
-                  <span className="mr-2">
+                  <span className="mr-1">
                     <Spinner size={10} />
                   </span>
                 )}
                 {connected
                   ? recording
-                    ? `PacketSniffer - ${proxyPort}`
-                    : "PacketSniffer - Paused"
-                  : "PacketSniffer - Connecting"}
+                    ? `${proxyPort}`
+                    : "Paused"
+                  : "Connecting"}
               </div>
             </Button>
           </DropdownMenuTrigger>

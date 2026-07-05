@@ -4,6 +4,8 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
 import { formatSize, formatTime, shortType } from "@/lib/utils";
 import type { HttpSession } from "@/types";
+import { Pin, RadioTower, FilterX } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import Spinner from "./Spinner";
 import {
   ContextMenu,
@@ -22,6 +24,11 @@ import {
 interface RequestTableProps {
   sessions: Map<number, HttpSession>;
   order: number[];
+  /** Total captured requests before filtering — distinguishes "no traffic yet"
+   *  from "traffic exists but the filters hide all of it". */
+  totalCount: number;
+  hasActiveFilters: boolean;
+  onClearFilters: () => void;
   selectedId: number | null;
   onSelect: (id: number | null) => void;
   pinnedIds: Set<number>;
@@ -131,49 +138,49 @@ const RequestRow = memo(function RequestRow({
           className={cn(
             "group text-[12px] h-6 cursor-default",
             isSelected
-              ? "selected bg-primary text-primary-foreground"
+              ? "selected bg-select text-select-fg"
               : "hover:bg-muted/50 text-foreground",
           )}
         >
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary text-center border-r border-r-border/20 group-[.selected]:border-r-primary">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 text-center border-r border-r-border/20 border-l-2 border-l-transparent group-[.selected]:border-l-foreground">
             <span
               className={cn("inline-block w-2 h-2 rounded-full", dotClass(s))}
             />
           </td>
 
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary text-center border-r border-r-border/20 group-[.selected]:border-r-primary">
-            {isPinned ? <span className="text-yellow-500">📌</span> : ""}
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 text-center border-r border-r-border/20">
+            {isPinned && (
+              <Pin className="size-3 mx-auto fill-current text-foreground" />
+            )}
           </td>
 
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 border-r border-r-border/20 tabular-nums">
             {s.id}
           </td>
 
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary truncate">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 border-r border-r-border/20 truncate">
             <span
               className={cn(
                 "font-medium",
-                isSelected ? "text-primary-foreground" : "text-foreground",
+                isSelected ? "text-select-fg" : "text-foreground",
               )}
             >
               {s.host}
             </span>
             <span
               className={cn(
-                isSelected
-                  ? "text-primary-foreground/80"
-                  : "text-muted-foreground",
+                isSelected ? "text-select-fg/80" : "text-muted-foreground",
               )}
             >
               {s.path}
             </span>
           </td>
 
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary text-[11px] font-medium">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 border-r border-r-border/20 text-[11px] font-medium">
             {s.method}
           </td>
 
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary text-[11px] font-medium tabular-nums">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 border-r border-r-border/20 text-[11px] font-medium tabular-nums">
             {!s.complete && s.status === 0 ? (
               <div className="flex items-center gap-1.5 opacity-70">
                 <Spinner size={10} />
@@ -188,7 +195,7 @@ const RequestRow = memo(function RequestRow({
           </td>
 
           {/* Type */}
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary text-[11px] truncate">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 border-r border-r-border/20 text-[11px] truncate">
             {shortType(s.contentType) ||
               (!s.complete ? (
                 <div className="flex items-center opacity-40 h-full">
@@ -200,7 +207,7 @@ const RequestRow = memo(function RequestRow({
           </td>
 
           {/* Size */}
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums text-right whitespace-nowrap">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 border-r border-r-border/20 tabular-nums text-right whitespace-nowrap">
             {s.responseSize != null ? (
               formatSize(s.responseSize)
             ) : !s.complete ? (
@@ -213,7 +220,7 @@ const RequestRow = memo(function RequestRow({
           </td>
 
           {/* Duration */}
-          <td className="h-6 px-2 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary border-r border-r-border/20 group-[.selected]:border-r-primary tabular-nums text-right whitespace-nowrap">
+          <td className="h-6 px-2 m-0 border-b border-b-border/40 border-r border-r-border/20 tabular-nums text-right whitespace-nowrap">
             {s.duration != null ? (
               formatTime(s.duration)
             ) : !s.complete ? (
@@ -226,7 +233,7 @@ const RequestRow = memo(function RequestRow({
           </td>
 
           {/* Filler — absorbs slack so the grid fills the pane */}
-          <td className="h-6 m-0 border-b border-b-border/40 group-[.selected]:border-b-primary" />
+          <td className="h-6 m-0 border-b border-b-border/40" />
         </tr>
       </ContextMenuTrigger>
       <ContextMenuContent className="text-[12px] min-w-48">
@@ -258,6 +265,9 @@ const RequestRow = memo(function RequestRow({
 export default function RequestTable({
   sessions,
   order,
+  totalCount,
+  hasActiveFilters,
+  onClearFilters,
   selectedId,
   onSelect,
   pinnedIds,
@@ -391,7 +401,7 @@ export default function RequestTable({
               {(
                 [
                   ["dot", ""],
-                  ["pin", "📌"],
+                  ["pin", ""],
                   ["id", "ID"],
                   ["url", "URL"],
                   ["method", "Method"],
@@ -408,7 +418,11 @@ export default function RequestTable({
                     (id === "dot" || id === "pin") && "text-center",
                   )}
                 >
-                  {label}
+                  {id === "pin" ? (
+                    <Pin className="size-3 mx-auto text-muted-foreground" />
+                  ) : (
+                    label
+                  )}
                   {RESIZABLE.has(id) && (
                     <ResizeHandle onMouseDown={(e) => startResize(e, id)} />
                   )}
@@ -420,11 +434,45 @@ export default function RequestTable({
           <tbody>
             {order.length === 0 ? (
               <tr>
-                <td
-                  colSpan={COL_SPAN}
-                  className="text-center py-8 text-muted-foreground text-xs"
-                >
-                  No requests captured
+                <td colSpan={COL_SPAN} className="text-center">
+                  {hasActiveFilters && totalCount > 0 ? (
+                    <div className="flex flex-col items-center justify-center gap-3 py-16 select-none">
+                      <FilterX
+                        className="size-7 text-muted-foreground/50"
+                        strokeWidth={1.5}
+                      />
+                      <div className="text-[13px] font-medium text-foreground/70">
+                        No requests match your filters
+                      </div>
+                      <div className="text-[11px] text-muted-foreground max-w-xs">
+                        {totalCount} captured{" "}
+                        {totalCount === 1 ? "request is" : "requests are"} hidden
+                        by the active filters.
+                      </div>
+                      <Button
+                        size="sm"
+                        onClick={onClearFilters}
+                        className="mt-1"
+                      >
+                        <FilterX className="size-3.5 mr-1.5" />
+                        Clear all filters
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center gap-2 py-16 select-none">
+                      <RadioTower
+                        className="size-7 text-muted-foreground/50"
+                        strokeWidth={1.5}
+                      />
+                      <div className="text-[13px] font-medium text-foreground/70">
+                        Listening for traffic
+                      </div>
+                      <div className="text-[11px] text-muted-foreground max-w-xs">
+                        Captured requests appear here. Route an app or device
+                        through the proxy to get started.
+                      </div>
+                    </div>
+                  )}
                 </td>
               </tr>
             ) : (

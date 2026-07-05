@@ -354,7 +354,40 @@ export default function App() {
     sourceFilter,
   ]);
 
+  // A "filter" is anything that narrows the request list; the source (device)
+  // tab is a selector, not a filter, so it's excluded from the clear action.
+  const hasActiveFilters =
+    textFilter !== "" ||
+    contentFilter !== "All" ||
+    statusClasses.size > 0 ||
+    selectedDomains.size > 0 ||
+    showPinnedOnly;
+
+  const handleClearFilters = useCallback(() => {
+    setTextFilter("");
+    setContentFilter("All");
+    setStatusClasses(new Set());
+    setSelectedDomains(new Set());
+    setShowPinnedOnly(false);
+  }, []);
+
   const panelGroupRef = useRef<HTMLDivElement>(null);
+  const [containerWidth, setContainerWidth] = useState(0);
+
+  // The sidebar max-size is derived from a pixel budget, so it must be
+  // recomputed when the window (and thus the panel group) is resized — not
+  // only when traffic changes. Without this the % goes stale on resize and the
+  // sidebar can over/under-shoot at small widths.
+  useEffect(() => {
+    const el = panelGroupRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => {
+      setContainerWidth(entry.contentRect.width);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   const sidebarMaxSize = useMemo(() => {
     let longest = 0;
     for (const id of order) {
@@ -364,12 +397,12 @@ export default function App() {
     // Sidebar horizontal overhead: tree indent(20) + row px(8+8) + gap(6) + icon(14) + container pr(8) + scrollbar(12) aprox 76px
     // Monospace 11px char width approx 6.6px
     const neededPx = 76 + longest * 6.6;
-    const containerWidth =
-      panelGroupRef.current?.offsetWidth || window.innerWidth;
-    const pct = Math.ceil((neededPx / containerWidth) * 100);
+    const width =
+      containerWidth || panelGroupRef.current?.offsetWidth || window.innerWidth;
+    const pct = Math.ceil((neededPx / width) * 100);
     // force it between 15-50% (note to self: this takes pixels)
     return `${Math.max(15, Math.min(50, pct))}%`;
-  }, [sessions, order]);
+  }, [sessions, order, containerWidth]);
 
   const selectedSession =
     selectedId !== null ? (sessions.get(selectedId) ?? null) : null;
@@ -455,6 +488,9 @@ export default function App() {
                     <RequestTable
                       sessions={sessions}
                       order={filteredOrder}
+                      totalCount={order.length}
+                      hasActiveFilters={hasActiveFilters}
+                      onClearFilters={handleClearFilters}
                       selectedId={selectedId}
                       onSelect={setSelectedId}
                       pinnedIds={pinnedIds}
@@ -467,7 +503,7 @@ export default function App() {
 
                 <ResizablePanel defaultSize="50%" minSize="10%">
                   <div className="h-full w-full min-w-0 overflow-hidden">
-                    <ErrorBoundary key={selectedId ?? "none"}>
+                    <ErrorBoundary resetKey={selectedId ?? "none"}>
                       <DetailPanel
                         session={selectedSession}
                         wsMessages={selectedWsMessages}

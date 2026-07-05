@@ -57,6 +57,11 @@
     --color-sidebar-border: var(--sidebar-border);
     --color-panel-header: var(--panel-header);
 
+    /* Selection tint — a subtle neutral fill for selected rows/sources,
+       paired with a left ink edge bar. Kept strictly monochrome by design. */
+    --color-select: var(--select);
+    --color-select-fg: var(--select-fg);
+
     --color-method-get: var(--method-get);
     --color-method-post: var(--method-post);
     --color-method-put: var(--method-put);
@@ -97,6 +102,9 @@
     --sidebar-border: oklch(0.92 0 0);
 
     --panel-header: oklch(0.98 0 0);
+
+    --select: oklch(0.925 0 0);
+    --select-fg: var(--foreground);
 
     --method-get: oklch(0.3 0 0);
     --method-post: oklch(0.4 0 0);
@@ -139,6 +147,9 @@
 
     --panel-header: oklch(0.2 0 0);
 
+    --select: oklch(0.28 0 0);
+    --select-fg: var(--foreground);
+
     --method-get: oklch(0.9 0 0);
     --method-post: oklch(0.8 0 0);
     --method-put: oklch(0.7 0 0);
@@ -179,6 +190,11 @@ body,
     height: 12px;
 }
 ::-webkit-scrollbar-track {
+    background: transparent;
+}
+/* Where a horizontal + vertical scrollbar meet (e.g. the request table at
+   narrow widths). Unstyled, this renders a solid white square. */
+::-webkit-scrollbar-corner {
     background: transparent;
 }
 ::-webkit-scrollbar-thumb {

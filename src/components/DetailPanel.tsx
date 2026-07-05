@@ -8,7 +8,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
-import { MoreHorizontal } from "lucide-react";
+import { MoreHorizontal, MousePointerClick } from "lucide-react";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -188,8 +188,17 @@ export default function DetailPanel({ session, wsMessages }: DetailPanelProps) {
 
   if (!session) {
     return (
-      <div className="h-full flex items-center justify-center bg-background text-muted-foreground text-xs">
-        Select a request to inspect
+      <div className="h-full flex flex-col items-center justify-center gap-2 bg-background select-none">
+        <MousePointerClick
+          className="size-7 text-muted-foreground/50"
+          strokeWidth={1.5}
+        />
+        <div className="text-[13px] font-medium text-foreground/70">
+          No request selected
+        </div>
+        <div className="text-[11px] text-muted-foreground">
+          Pick a row above to inspect its headers, body, and timing.
+        </div>
       </div>
     );
   }
