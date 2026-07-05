@@ -36,6 +36,14 @@ pub struct DevicePackage {
     pub package: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppProtection {
+    /// App is wrapped in Google Play Automatic Integrity Protection (PAIRIP) —
+    /// repackaging can't work (see `run_patch`'s refusal), so the UI flags it.
+    pub pairip: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PatchOpts {
@@ -59,6 +67,17 @@ pub struct PatchOpts {
     /// ABI already present in the APK.
     #[serde(default)]
     pub frida_abi: String,
+    /// Run the gadget in *script mode*: bundle a Frida script + gadget config
+    /// inside the APK so the script auto-runs on launch, with NO PC-side `frida`
+    /// attach. When false the gadget runs in listen mode (waits for a
+    /// `frida -U Gadget` connection). Ignored unless `inject_frida` is set.
+    #[serde(default)]
+    pub frida_script_mode: bool,
+    /// Path to a custom Frida `.js` script to bundle in script mode. Empty ⇒ a
+    /// built-in generic anti-tamper bypass is used. Only read when both
+    /// `inject_frida` and `frida_script_mode` are set.
+    #[serde(default)]
+    pub frida_script_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +146,22 @@ pub async fn list_device_packages(serial: String) -> Result<Vec<DevicePackage>, 
     tokio::task::spawn_blocking(move || device_packages(&serial))
         .await
         .map_err(|e| format!("task join error: {e}"))?
+}
+
+/// Probe whether an installed app is PAIRIP-protected, so the UI can flag it
+/// before the user attempts a patch that can't work. Cheap: inspects the app's
+/// on-device APKs (zip central directory only) rather than pulling them.
+#[tauri::command]
+pub async fn check_app_protection(serial: String, package: String) -> Result<AppProtection, String> {
+    validate_serial(&serial)?;
+    validate_package(&package)?;
+    tokio::task::spawn_blocking(move || {
+        Ok(AppProtection {
+            pairip: device_has_pairip(&serial, &package),
+        })
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 /// Pull a package's APKs off a device into the working directory and return the
@@ -917,6 +952,45 @@ fn device_packages(serial: &str) -> Result<Vec<DevicePackage>, String> {
     Ok(pkgs)
 }
 
+/// True if any of the package's on-device APKs contains `libpairipcore.so` (the
+/// PAIRIP native VM). Uses `unzip -l` (reads the zip central directory only — fast
+/// even for a 100 MB base) over adb. Best-effort: any failure ⇒ false, so a flaky
+/// probe never blocks the user (run_patch still refuses PAIRIP as the backstop).
+fn device_has_pairip(serial: &str, package: &str) -> bool {
+    let Ok(out) = run(
+        Command::new("adb").args(["-s", serial, "shell", "pm", "path", package]),
+        "pm path",
+    ) else {
+        return false;
+    };
+    for line in out.lines() {
+        let Some(path) = line.trim().strip_prefix("package:") else {
+            continue;
+        };
+        let path = path.trim();
+        // Paths come from the package manager, but stay defensive: only shell-safe
+        // characters, so the single-quoted path below can't break out of its quotes.
+        if path.is_empty()
+            || !path.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '=' | '+')
+            })
+        {
+            continue;
+        }
+        let probe = format!("unzip -l '{path}' 2>/dev/null | grep -c libpairipcore.so");
+        if let Ok(res) = run(
+            Command::new("adb").args(["-s", serial, "shell", &probe]),
+            "pairip probe",
+        ) {
+            let count: u32 = res.trim().lines().next().unwrap_or("0").trim().parse().unwrap_or(0);
+            if count > 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn pull_base_apk(serial: &str, package: &str) -> Result<String, String> {
     let out = run(
         Command::new("adb").args(["-s", serial, "shell", "pm", "path", package]),
@@ -983,6 +1057,18 @@ fn pull_base_apk(serial: &str, package: &str) -> Result<String, String> {
 
 fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
     let apk = validate_apk_path(&opts.apk_path)?;
+    // Refuse PAIRIP apps up front — repackaging fundamentally can't work on them.
+    if detect_pairip(&apk) {
+        return Err(
+            "This app uses Google Play Automatic Integrity Protection (PAIRIP): its code is \
+             virtualized and libpairipcore.so verifies integrity in native code, so any re-sign \
+             trips it — the app redirects to the Play Store and exits. Repackaging cannot bypass \
+             this. To capture its traffic, use a rooted device with the proxy CA installed as a \
+             system certificate (keeping the original Play-signed app), plus Frida for any extra \
+             pinning."
+                .to_string(),
+        );
+    }
     let mut warnings = Vec::new();
     let dir = work_dir()?;
     let stem = apk
@@ -1091,7 +1177,14 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
     // Config-level pins are gone (we overwrote the nsc); warn about code pins.
     if opts.inject_frida {
         progress(app, "frida", "Injecting Frida gadget…");
-        match inject_frida(&decode_dir, &opts.frida_gadget_path, &opts.frida_abi) {
+        match inject_frida(
+            &decode_dir,
+            &opts.frida_gadget_path,
+            &opts.frida_abi,
+            opts.frida_script_mode,
+            &opts.frida_script_path,
+            &apk,
+        ) {
             Ok(notes) => warnings.extend(notes),
             Err(e) => return Err(format!("Frida injection failed: {e}")),
         }
@@ -1147,6 +1240,48 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
         output_path: signed.to_string_lossy().to_string(),
         warnings,
     })
+}
+
+/// Google Play Automatic Integrity Protection (PAIRIP) wraps the app in a native
+/// VM (`libpairipcore.so`) and verifies integrity in native code, redirecting to
+/// the Play "license paywall" and exiting on any re-sign — so repackaging can
+/// never work. The native lib ships in the arm64/abi *config split*, not base, so
+/// scan the base APK and its sibling config splits. Matches the marker filename
+/// in the raw zip bytes (stored uncompressed in the local/central headers), which
+/// avoids a full zip parse.
+fn detect_pairip(base_apk: &Path) -> bool {
+    const MARKER: &[u8] = b"libpairipcore.so";
+    if file_contains(base_apk, MARKER) {
+        return true;
+    }
+    let (Some(dir), Some(stem)) = (
+        base_apk.parent(),
+        base_apk.file_stem().and_then(|s| s.to_str()),
+    ) else {
+        return false;
+    };
+    // Config splits are pulled alongside the base as `{stem}.split.*` (see pull_base_apk).
+    let prefix = format!("{stem}.split.");
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".apk") && file_contains(&e.path(), MARKER) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if `path`'s bytes contain `needle`. Reads the whole file — a one-time
+/// patch pre-check, fine for APK-sized inputs.
+fn file_contains(path: &Path, needle: &[u8]) -> bool {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes.windows(needle.len()).any(|w| w == needle),
+        Err(_) => false,
+    }
 }
 
 /// Copy the proxy's `ca-cert.pem` into the decoded tree as `res/raw/proxy_ca.pem`
@@ -1334,12 +1469,245 @@ mod meta_data_tests {
     }
 }
 
+#[cfg(test)]
+mod sig_block_tests {
+    use super::v2v3_first_cert_der;
+
+    /// u32-length-prefix `data` (little-endian) — the APK Signing Block convention.
+    fn lp(data: &[u8]) -> Vec<u8> {
+        let mut o = (data.len() as u32).to_le_bytes().to_vec();
+        o.extend_from_slice(data);
+        o
+    }
+
+    /// Wrap a signing block + EOCD around `pair_body` (id+value) so the reader
+    /// finds a valid central-directory offset and magic.
+    fn apk_with_pair(pair_body: &[u8]) -> Vec<u8> {
+        let mut pairs = (pair_body.len() as u64).to_le_bytes().to_vec();
+        pairs.extend_from_slice(pair_body);
+
+        let block_size = (pairs.len() + 8 + 16) as u64;
+        let mut block = block_size.to_le_bytes().to_vec();
+        block.extend_from_slice(&pairs);
+        block.extend_from_slice(&block_size.to_le_bytes());
+        block.extend_from_slice(b"APK Sig Block 42");
+
+        let prefix = vec![0u8; 8];
+        let cd_offset = (prefix.len() + block.len()) as u32;
+        let mut eocd = vec![0x50u8, 0x4b, 0x05, 0x06];
+        eocd.extend_from_slice(&[0u8; 12]); // disk/count/cd-size (zeroed)
+        eocd.extend_from_slice(&cd_offset.to_le_bytes());
+        eocd.extend_from_slice(&[0u8, 0]); // comment length
+
+        let mut apk = prefix;
+        apk.extend_from_slice(&block);
+        apk.extend_from_slice(&eocd);
+        apk
+    }
+
+    #[test]
+    fn extracts_first_cert_from_v2_block() {
+        let cert: &[u8] = b"FAKE-DER-CERTIFICATE-BYTES";
+        // signed data = [digests seq (empty)] [certificates seq [cert]]
+        let mut signed_data = lp(&[]);
+        signed_data.extend(lp(&lp(cert)));
+        let value = lp(&lp(&lp(&signed_data))); // value = lp(signers = lp(signer = lp(signed_data)))
+
+        let mut pair_body = 0x7109_871au32.to_le_bytes().to_vec(); // v2 id
+        pair_body.extend_from_slice(&value);
+
+        assert_eq!(
+            v2v3_first_cert_der(&apk_with_pair(&pair_body)).as_deref(),
+            Some(cert)
+        );
+    }
+
+    #[test]
+    fn returns_none_without_signing_block() {
+        // 32-byte prefix + bare EOCD → cd_offset lands in the prefix, magic check
+        // fails, so no cert is returned.
+        let mut apk = vec![0u8; 32];
+        let cd_offset = apk.len() as u32;
+        apk.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        apk.extend_from_slice(&[0u8; 12]);
+        apk.extend_from_slice(&cd_offset.to_le_bytes());
+        apk.extend_from_slice(&[0u8, 0]);
+        assert_eq!(v2v3_first_cert_der(&apk), None);
+    }
+}
+
+#[cfg(test)]
+mod pairip_tests {
+    use super::detect_pairip;
+    use std::fs;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pairip-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn detects_marker_in_sibling_split() {
+        let dir = tmp("split");
+        let base = dir.join("com.example.apk");
+        fs::write(&base, b"PK\x03\x04 no marker in base").unwrap();
+        assert!(!detect_pairip(&base), "clean base+no splits must not match");
+
+        // The native lib lives in a config split, not base — must still detect.
+        fs::write(
+            dir.join("com.example.split.config.arm64_v8a.apk"),
+            b"....lib/arm64-v8a/libpairipcore.so....",
+        )
+        .unwrap();
+        assert!(detect_pairip(&base), "marker in sibling split must match");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_marker_in_base() {
+        let dir = tmp("base");
+        let base = dir.join("app.apk");
+        fs::write(&base, b"zip...lib/arm64-v8a/libpairipcore.so...").unwrap();
+        assert!(detect_pairip(&base));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 // ─── Frida gadget injection ───────────────────────────────────────────────────
 // Places libfrida-gadget.so in the right ABI dir and forces the app to load it
 // by injecting `System.loadLibrary("frida-gadget")` into the launcher activity's
-// static initializer. Best-effort: returns notes/warnings for the caller.
+// static initializer. In *script mode* it also bundles a Frida script + gadget
+// config so the script auto-runs on launch (no PC-side `frida` attach); otherwise
+// the gadget runs in listen mode. Best-effort: returns notes/warnings.
 
-fn inject_frida(decode_dir: &Path, gadget_path: &str, abi_pref: &str) -> Result<Vec<String>, String> {
+/// Default Frida script bundled in script mode when the user supplies none. A
+/// generic, cert-independent bypass for repackaged apps that detect the re-sign
+/// and bounce to the Play Store: it swallows Play-Store redirect intents and
+/// blocks the app from killing itself. App-specific pinning/integrity needs
+/// custom hooks — the script carries commented scaffolds for those.
+const DEFAULT_FRIDA_BYPASS: &str = r#"/*
+ * PacketSniffer - default Frida bypass (Gadget script mode, auto-runs on launch).
+ *
+ * Generic help for a repackaged (re-signed) app that refuses to run and bounces
+ * you to the Play Store ("Get this app from Play"). It does NOT need the app's
+ * original signing certificate - instead it neuters the two things such apps do
+ * on a failed integrity check: open the Play listing, and kill themselves.
+ *
+ * This is a STARTING POINT. Apps that gate features behind a server-side verdict
+ * (Play Integrity) or pin certs in native code need app-specific hooks - see the
+ * commented scaffolds at the bottom. Supply your own .js in the patch dialog to
+ * replace this file.
+ */
+Java.perform(function () {
+  function log(m) { console.log('[packetsniffer] ' + m); }
+
+  // Does this intent send the user to the Play Store?
+  function isPlayIntent(intent) {
+    try {
+      var data = intent.getDataString();
+      if (data) {
+        var d = data.toLowerCase();
+        if (d.indexOf('play.google.com') !== -1 || d.indexOf('market://') !== -1) return true;
+      }
+      if (intent.getPackage() === 'com.android.vending') return true;
+      var c = intent.getComponent();
+      if (c !== null && c.getPackageName() === 'com.android.vending') return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // 1. Swallow redirects to the Play Store (every startActivity overload on both
+  //    Activity and ContextWrapper - covers Activity/Application/Service callers).
+  ['android.app.Activity', 'android.content.ContextWrapper'].forEach(function (cn) {
+    try {
+      var C = Java.use(cn);
+      C.startActivity.overloads.forEach(function (ov) {
+        ov.implementation = function () {
+          if (arguments.length > 0 && arguments[0] !== null && isPlayIntent(arguments[0])) {
+            log('blocked Play-Store redirect (' + cn + '.startActivity)');
+            return;
+          }
+          return ov.apply(this, arguments);
+        };
+      });
+    } catch (e) {}
+  });
+  try {
+    var Act = Java.use('android.app.Activity');
+    Act.startActivityForResult.overloads.forEach(function (ov) {
+      ov.implementation = function () {
+        if (arguments.length > 0 && arguments[0] !== null && isPlayIntent(arguments[0])) {
+          log('blocked Play-Store redirect (startActivityForResult)');
+          return;
+        }
+        return ov.apply(this, arguments);
+      };
+    });
+  } catch (e) {}
+
+  // 2. Stop the app killing itself after a failed check.
+  try { var S = Java.use('java.lang.System'); S.exit.implementation = function (c) { log('blocked System.exit(' + c + ')'); }; } catch (e) {}
+  try { var P = Java.use('android.os.Process'); P.killProcess.implementation = function (p) { log('blocked Process.killProcess(' + p + ')'); }; } catch (e) {}
+  try { var R = Java.use('java.lang.Runtime'); R.exit.implementation = function (c) { log('blocked Runtime.exit(' + c + ')'); }; R.halt.implementation = function (c) { log('blocked Runtime.halt(' + c + ')'); }; } catch (e) {}
+
+  // 3. Signature self-check spoof. The app's ORIGINAL signing cert (base64 DER)
+  //    is baked in at patch time; if it couldn't be extracted the token is empty
+  //    and this whole block is a no-op. Makes PackageManager report the ORIGINAL
+  //    cert so apps comparing their runtime signature to a hardcoded value pass.
+  var ORIGINAL_CERT_B64 = '__CERT_B64__';
+  if (ORIGINAL_CERT_B64.length > 0) {
+    try {
+      var Signature = Java.use('android.content.pm.Signature');
+      var B64 = Java.use('android.util.Base64');
+      var SIG = 'android.content.pm.Signature';
+      var makeSig = function () { return Signature.$new(B64.decode(ORIGINAL_CERT_B64, 0)); };
+      var spoofInfo = function (info) {
+        try { if (info.signatures.value !== null) info.signatures.value = Java.array(SIG, [makeSig()]); } catch (e) {}
+        return info;
+      };
+      var APM = Java.use('android.app.ApplicationPackageManager');
+      // GET_SIGNATURES path (legacy).
+      try {
+        APM.getPackageInfo.overload('java.lang.String', 'int').implementation = function (p, f) {
+          return spoofInfo(this.getPackageInfo(p, f));
+        };
+      } catch (e) {}
+      // API 33+ PackageInfoFlags overload.
+      try {
+        APM.getPackageInfo.overload('java.lang.String', 'android.content.pm.PackageManager$PackageInfoFlags').implementation = function (p, f) {
+          return spoofInfo(this.getPackageInfo(p, f));
+        };
+      } catch (e) {}
+      // GET_SIGNING_CERTIFICATES path (API 28+).
+      var SI = Java.use('android.content.pm.SigningInfo');
+      try { SI.getApkContentsSigners.implementation = function () { return Java.array(SIG, [makeSig()]); }; } catch (e) {}
+      try { SI.getSigningCertificateHistory.implementation = function () { return Java.array(SIG, [makeSig()]); }; } catch (e) {}
+      try { SI.hasMultipleSigners.implementation = function () { return false; }; } catch (e) {}
+      log('signature spoof active (original cert restored)');
+    } catch (e) { log('signature spoof failed: ' + e); }
+  }
+
+  log('bypass installed (Play-redirect + self-kill + signature spoof)');
+
+  // --- Further app-specific hooks (edit as needed) ---------------------------
+  // OkHttp CertificatePinner:
+  //   Java.use('okhttp3.CertificatePinner').check.overload(
+  //     'java.lang.String', 'java.util.List').implementation = function () {};
+  // Play Integrity / SafetyNet: hook the app's verdict handler to force a genuine
+  // result - class names are app- and version-specific.
+});
+"#;
+
+fn inject_frida(
+    decode_dir: &Path,
+    gadget_path: &str,
+    abi_pref: &str,
+    script_mode: bool,
+    script_path: &str,
+    src_apk: &Path,
+) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     let gadget = PathBuf::from(gadget_path);
     if !gadget.is_file() {
@@ -1392,6 +1760,53 @@ fn inject_frida(decode_dir: &Path, gadget_path: &str, abi_pref: &str) -> Result<
     std::fs::copy(&gadget, abi_dir.join("libfrida-gadget.so"))
         .map_err(|e| format!("copy gadget: {e}"))?;
 
+    // 2b. Script mode: bundle a Frida script + gadget config next to the gadget so
+    //     the script auto-runs on launch — no PC-side `frida` attach. Both files
+    //     MUST end in `.so`: Android's installer only extracts `*.so` entries from
+    //     lib/<abi>/ into the app's native-lib dir, and the gadget reads its config
+    //     from that real directory. The gadget looks for `<its-name>.config.so`
+    //     (libfrida-gadget.config.so); the config points at the script by a path
+    //     relative to that dir. Relies on the libs being on a real filesystem —
+    //     guaranteed by the android:extractNativeLibs="true" forced in run_patch.
+    if script_mode {
+        let mut script = if script_path.trim().is_empty() {
+            DEFAULT_FRIDA_BYPASS.to_string()
+        } else {
+            std::fs::read_to_string(script_path)
+                .map_err(|e| format!("read Frida script '{script_path}': {e}"))?
+        };
+        // Bake the app's ORIGINAL signing certificate into the script (if it uses
+        // the `__CERT_B64__` token) so it can spoof signature self-checks. Read
+        // from the *source* APK before we re-sign it. Best-effort: on failure the
+        // token becomes empty and the script's signature-spoof block no-ops.
+        if script.contains("__CERT_B64__") {
+            match original_signing_cert_b64(src_apk) {
+                Ok(b64) => {
+                    script = script.replace("__CERT_B64__", &b64);
+                    notes.push(
+                        "Baked the app's original signing certificate into the Frida script — it \
+                         spoofs PackageManager signature / SigningInfo lookups so self-signature \
+                         checks see the original cert."
+                            .to_string(),
+                    );
+                }
+                Err(e) => {
+                    script = script.replace("__CERT_B64__", "");
+                    notes.push(format!(
+                        "Could not read the original signing cert ({e}); signature-spoof left off \
+                         (Play-redirect + self-kill hooks still active)."
+                    ));
+                }
+            }
+        }
+        std::fs::write(abi_dir.join("libfrida-gadget.script.so"), script)
+            .map_err(|e| format!("write Frida script: {e}"))?;
+        // Gadget config: run the bundled script (path resolved relative to this dir).
+        let config = "{\n  \"interaction\": {\n    \"type\": \"script\",\n    \"path\": \"./libfrida-gadget.script.so\",\n    \"on_change\": \"reload\"\n  }\n}\n";
+        std::fs::write(abi_dir.join("libfrida-gadget.config.so"), config)
+            .map_err(|e| format!("write Frida config: {e}"))?;
+    }
+
     // 3. Force-load it from the launcher activity's <clinit>.
     let manifest =
         std::fs::read_to_string(decode_dir.join("AndroidManifest.xml")).map_err(|e| e.to_string())?;
@@ -1410,10 +1825,24 @@ fn inject_frida(decode_dir: &Path, gadget_path: &str, abi_pref: &str) -> Result<
     };
     std::fs::write(&smali_path, patched).map_err(|e| e.to_string())?;
 
-    notes.push(format!(
-        "Frida gadget injected into {} (lib/{abi}). Connect with `frida -U Gadget`.",
-        launcher
-    ));
+    notes.push(format!("Frida gadget injected into {launcher} (lib/{abi})."));
+    if script_mode {
+        notes.push(if script_path.trim().is_empty() {
+            "Frida script mode: bundled the built-in generic bypass — it auto-runs on \
+             launch (no PC attach) and blocks Play-Store redirects and app self-kills. \
+             Supply a custom .js for app-specific cert pinning / integrity checks."
+                .to_string()
+        } else {
+            format!("Frida script mode: bundled '{script_path}' — auto-runs on launch, no PC attach.")
+        });
+    } else {
+        notes.push(
+            "Frida gadget in listen mode: launch the app (it blocks on startup), then attach \
+             from a PC with `frida -U Gadget -l yourscript.js`. Turn on script mode to bundle \
+             a self-running script instead."
+                .to_string(),
+        );
+    }
     Ok(notes)
 }
 
@@ -1526,6 +1955,136 @@ fn add_fresh_clinit(smali: &str, lib: &str) -> String {
         Some(idx) => format!("{}{}{}", &smali[..idx + 1], method, &smali[idx + 1..]),
         None => format!("{smali}\n{method}"),
     }
+}
+
+// ─── Original signing-certificate extraction (for the Frida signature spoof) ───
+// Reads the source APK's signing certificate so the bundled Frida script can make
+// PackageManager report the ORIGINAL cert — defeating self-signature checks that
+// our debug re-sign would otherwise trip. Prefer the v2/v3 APK Signing Block
+// (modern apps, no external tool); fall back to keytool for a v1 (JAR) signature.
+
+/// Standard base64 (single line) of the app's first signing certificate (DER).
+fn original_signing_cert_b64(apk: &Path) -> Result<String, String> {
+    if let Ok(bytes) = std::fs::read(apk) {
+        if let Some(der) = v2v3_first_cert_der(&bytes) {
+            use base64::Engine;
+            return Ok(base64::engine::general_purpose::STANDARD.encode(der));
+        }
+    }
+    // v1-only APK (no signing block): ask keytool for the JAR signer cert (PEM).
+    v1_cert_b64(apk)
+        .ok_or_else(|| "no v2/v3 signing block and keytool returned no v1 certificate".to_string())
+}
+
+/// Base64 body of the v1 (JAR) signing cert via `keytool -printcert -rfc`, or None.
+fn v1_cert_b64(apk: &Path) -> Option<String> {
+    let out = run(
+        Command::new("keytool")
+            .args(["-printcert", "-rfc", "-jarfile"])
+            .arg(apk),
+        "keytool printcert",
+    )
+    .ok()?;
+    let begin = "-----BEGIN CERTIFICATE-----";
+    let end = "-----END CERTIFICATE-----";
+    let b = out.find(begin)? + begin.len();
+    let e = out[b..].find(end)? + b;
+    let body: String = out[b..e].split_whitespace().collect();
+    (!body.is_empty()).then_some(body)
+}
+
+// ── APK Signing Block (v2/v3) reader ─────────────────────────────────────────
+// Walks only the length fields to pull the first signer's raw X.509 cert (DER);
+// it does not parse the certificate itself. All integers are little-endian.
+
+fn le_u32(b: &[u8], o: usize) -> Option<u32> {
+    b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+fn le_u64(b: &[u8], o: usize) -> Option<u64> {
+    b.get(o..o + 8)
+        .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+}
+/// Read a u32-length-prefixed slice at `o`; return (slice, offset just past it).
+fn read_lp32(b: &[u8], o: usize) -> Option<(&[u8], usize)> {
+    let n = le_u32(b, o)? as usize;
+    let start = o + 4;
+    let end = start.checked_add(n)?;
+    Some((b.get(start..end)?, end))
+}
+/// Read a u32-length-prefixed slice at `o`.
+fn lp32(b: &[u8], o: usize) -> Option<&[u8]> {
+    read_lp32(b, o).map(|(s, _)| s)
+}
+
+/// Central-directory start offset from the ZIP End-of-Central-Directory record.
+fn zip_cd_offset(b: &[u8]) -> Option<usize> {
+    const SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+    let last = b.len().checked_sub(22)?;
+    let min = b.len().saturating_sub(65_557); // 22 + max comment 65535
+    let mut i = last;
+    loop {
+        if b[i..i + 4] == SIG {
+            return le_u32(b, i + 16).map(|v| v as usize);
+        }
+        if i == min {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
+/// First signer's certificate (DER) from a v2/v3 APK Signing Block, if present.
+fn v2v3_first_cert_der(b: &[u8]) -> Option<Vec<u8>> {
+    let cd = zip_cd_offset(b)?;
+    if cd < 24 || cd > b.len() {
+        return None;
+    }
+    let magic = b.get(cd - 16..cd)?;
+    if magic != b"APK Sig Block 42" {
+        return None;
+    }
+    let block_size = le_u64(b, cd - 24)? as usize;
+    let block_start = cd.checked_sub(8 + block_size)?;
+    if le_u64(b, block_start)? as usize != block_size {
+        return None;
+    }
+    // ID-value pairs live between the leading size field and the trailing size.
+    let pairs = b.get(block_start + 8..cd - 24)?;
+    let mut i = 0usize;
+    let mut v3: Option<Vec<u8>> = None;
+    while i + 8 <= pairs.len() {
+        let plen = le_u64(pairs, i)? as usize;
+        if plen < 4 {
+            break;
+        }
+        let start = i + 8;
+        let end = start.checked_add(plen)?;
+        if end > pairs.len() {
+            break;
+        }
+        let id = le_u32(pairs, start)?;
+        let value = &pairs[start + 4..end];
+        if id == 0x7109_871a {
+            return signer_seq_first_cert(value); // v2 — preferred
+        } else if id == 0xf053_68c0 && v3.is_none() {
+            v3 = signer_seq_first_cert(value); // v3 — fallback
+        }
+        i = end;
+    }
+    v3
+}
+
+/// `value` = u32-len-prefixed signers; dig to the first signer's first cert.
+/// Signed-data begins with a digests sequence, then the certificates sequence
+/// (same placement in v2 and v3), so skip digests and read certificate #0.
+fn signer_seq_first_cert(value: &[u8]) -> Option<Vec<u8>> {
+    let signers = lp32(value, 0)?;
+    let signer = lp32(signers, 0)?;
+    let signed_data = lp32(signer, 0)?;
+    let (_digests, after) = read_lp32(signed_data, 0)?;
+    let certs = lp32(signed_data, after)?;
+    let cert = lp32(certs, 0)?;
+    Some(cert.to_vec())
 }
 
 // ─── Paths, validation, process helpers ───────────────────────────────────────

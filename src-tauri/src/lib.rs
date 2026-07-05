@@ -429,6 +429,7 @@ pub fn run() {
             apk::check_apk_tools,
             apk::list_adb_devices,
             apk::list_device_packages,
+            apk::check_app_protection,
             apk::pull_apk,
             apk::patch_apk,
             apk::install_patched_apk,

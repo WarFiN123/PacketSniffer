@@ -21,6 +21,8 @@ export interface PatchOpts {
   frida: boolean;
   fridaPath: string;
   fridaAbi: string;
+  fridaScriptMode: boolean;
+  fridaScriptPath: string;
 }
 
 export const DEFAULT_PATCH_OPTS: PatchOpts = {
@@ -30,6 +32,8 @@ export const DEFAULT_PATCH_OPTS: PatchOpts = {
   frida: false,
   fridaPath: "",
   fridaAbi: "auto",
+  fridaScriptMode: true,
+  fridaScriptPath: "",
 };
 
 // Map the UI options onto the serde shape `patch_apk` expects.
@@ -42,6 +46,8 @@ export function backendPatchOpts(apkPath: string, o: PatchOpts) {
     injectFrida: o.frida,
     fridaGadgetPath: o.fridaPath,
     fridaAbi: o.fridaAbi,
+    fridaScriptMode: o.fridaScriptMode,
+    fridaScriptPath: o.fridaScriptPath,
   };
 }
 
@@ -66,6 +72,19 @@ export default function PatchOptions({
         filters: [{ name: "Frida gadget", extensions: ["so"] }],
       });
       if (typeof picked === "string") onChange({ fridaPath: picked });
+    } catch {
+      /* cancelled */
+    }
+  };
+
+  const browseScript = async () => {
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Frida script", extensions: ["js"] }],
+      });
+      if (typeof picked === "string") onChange({ fridaScriptPath: picked });
     } catch {
       /* cancelled */
     }
@@ -132,6 +151,33 @@ export default function PatchOptions({
               </SelectContent>
             </Select>
           </div>
+
+          <div className="flex items-center justify-between gap-3 pt-1">
+            <div className="min-w-0">
+              <div className="text-[12px] text-text-0">Auto-run script (no PC)</div>
+              <div className="text-[10px] text-muted-foreground leading-snug">
+                Bundle a bypass so it runs on launch — no frida attach needed.
+              </div>
+            </div>
+            <Switch
+              checked={opts.fridaScriptMode}
+              onChange={(v) => onChange({ fridaScriptMode: v })}
+            />
+          </div>
+          {opts.fridaScriptMode && (
+            <div className="flex items-center gap-2">
+              <Input
+                value={opts.fridaScriptPath}
+                placeholder="custom .js (optional — built-in bypass if empty)"
+                spellCheck={false}
+                onChange={(e) => onChange({ fridaScriptPath: e.target.value })}
+                className="h-7 text-[12px] font-mono flex-1"
+              />
+              <Button variant="outline" size="xs" onClick={browseScript}>
+                <FolderOpen className="size-3.5" />
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </div>

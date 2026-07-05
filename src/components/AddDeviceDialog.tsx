@@ -18,6 +18,7 @@ import PatchOptions, {
   backendPatchOpts,
   patchOptsValid,
 } from "./PatchOptions";
+import { useAppProtection, PairipChip, PairipBanner } from "./PairipNotice";
 import type { ConnectedDevice, SessionEvent } from "@/types";
 import {
   Monitor,
@@ -99,6 +100,9 @@ export default function AddDeviceDialog({
   const [pkg, setPkg] = useState("");
   const [query, setQuery] = useState("");
   const [pkgLoading, setPkgLoading] = useState(false);
+  // PAIRIP-protected apps can't be repackaged — flag the selected one.
+  const { protection: pkgProtection } = useAppProtection(serial, pkg);
+  const pairip = !!pkgProtection?.pairip;
   const [patchApp, setPatchApp] = useState(false);
   const [patchOpts, setPatchOpts] = useState<PatchOpts>(DEFAULT_PATCH_OPTS);
   const [connecting, setConnecting] = useState(false);
@@ -306,7 +310,7 @@ export default function AddDeviceDialog({
       await invoke("start_device_capture", { serial, tag });
       captureStarted = true;
 
-      if (pkg && patchApp) {
+      if (pkg && patchApp && !pairip) {
         setStage("Unpacking the app…");
         const path = await invoke<string>("pull_apk", { serial, package: pkg });
         setStage("Embedding the certificate…");
@@ -338,7 +342,7 @@ export default function AddDeviceDialog({
     } finally {
       setConnecting(false);
     }
-  }, [serial, pkg, patchApp, patchOpts, devices, goLive]);
+  }, [serial, pkg, patchApp, pairip, patchOpts, devices, goLive]);
 
   // User accepted the data-wiping reinstall: replace the app, then resume onboarding.
   const confirmReplace = useCallback(async () => {
@@ -447,6 +451,7 @@ export default function AddDeviceDialog({
                       setPatchOpts((prev) => ({ ...prev, ...p }))
                     }
                     canPatch={canPatch}
+                    pairip={pairip}
                     connecting={connecting}
                     stage={stage}
                     connectErr={connectErr}
@@ -1032,6 +1037,7 @@ function AppStep({
   patchOpts,
   onPatchOpts,
   canPatch,
+  pairip,
   connecting,
   stage,
   connectErr,
@@ -1048,6 +1054,7 @@ function AppStep({
   patchOpts: PatchOpts;
   onPatchOpts: (patch: Partial<PatchOpts>) => void;
   canPatch: boolean;
+  pairip: boolean;
   connecting: boolean;
   stage: string;
   connectErr: string;
@@ -1071,7 +1078,7 @@ function AppStep({
     );
   }
 
-  const patchEnabled = canPatch && !!pkg;
+  const patchEnabled = canPatch && !!pkg && !pairip;
 
   return (
     <div className="space-y-5">
@@ -1119,9 +1126,10 @@ function AppStep({
                 >
                   {pkg === p.package && <Check className="size-2.5" />}
                 </span>
-                <span className="font-mono text-[12px] text-text-0 truncate">
+                <span className="font-mono text-[12px] text-text-0 truncate flex-1">
                   {p.package}
                 </span>
+                {pkg === p.package && pairip && <PairipChip />}
               </button>
             ))
           )}
@@ -1135,6 +1143,8 @@ function AppStep({
           trusted). Nothing is reinstalled.
         </p>
       )}
+
+      {pkg && pairip && <PairipBanner />}
 
       {/* Advanced: patch the selected app */}
       <label
@@ -1150,11 +1160,13 @@ function AppStep({
             HTTPS
           </div>
           <div className="text-[11px] text-muted-foreground leading-snug mt-0.5">
-            {!pkg
-              ? "Select an app above to enable this. Only needed for apps that pin their certificate."
-              : !canPatch
-                ? "Needs the patch toolchain (step 1)."
-                : "Repackages the app to trust PacketSniffer. Reinstalls it once, which clears its data — Android won't update a re-signed app. Leave off to keep the app and its data untouched."}
+            {pairip
+              ? "This app is PAIRIP-protected — patching can't work. You can still capture it, just without decrypting its HTTPS."
+              : !pkg
+                ? "Select an app above to enable this. Only needed for apps that pin their certificate."
+                : !canPatch
+                  ? "Needs the patch toolchain (step 1)."
+                  : "Repackages the app to trust PacketSniffer. Reinstalls it once, which clears its data — Android won't update a re-signed app. Leave off to keep the app and its data untouched."}
           </div>
         </div>
         <Switch

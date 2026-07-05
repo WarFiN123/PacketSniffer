@@ -27,6 +27,7 @@ import PatchOptions, {
   backendPatchOpts,
   patchOptsValid,
 } from "./PatchOptions";
+import { useAppProtection, PairipChip, PairipBanner } from "./PairipNotice";
 import {
   Boxes,
   Smartphone,
@@ -81,6 +82,8 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
   const [packages, setPackages] = useState<DevicePackage[]>([]);
   const [pkg, setPkg] = useState("");
   const [pkgLoading, setPkgLoading] = useState(false);
+  // Flag PAIRIP-protected apps (repackaging can't work) once one is selected.
+  const { protection } = useAppProtection(serial, pkg);
 
   // ── Options ────────────────────────────────────────────────────────────
   const [opts, setOpts] = useState<PatchOpts>(DEFAULT_PATCH_OPTS);
@@ -193,6 +196,7 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
     missingTools !== null &&
     missingTools.length === 0 &&
     patchOptsValid(opts) &&
+    !protection?.pairip &&
     (source === "file" ? apkPath !== "" : pkg !== "");
 
   const startPatch = async () => {
@@ -375,11 +379,14 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
                   </div>
 
                   <div className="space-y-1.5">
-                    <Label className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                      Package{" "}
-                      {pkgLoading && (
-                        <span className="text-text-2">· loading…</span>
-                      )}
+                    <Label className="flex items-center gap-2 text-[11px] uppercase tracking-wider text-muted-foreground">
+                      <span>
+                        Package{" "}
+                        {pkgLoading && (
+                          <span className="text-text-2">· loading…</span>
+                        )}
+                      </span>
+                      {protection?.pairip && <PairipChip />}
                     </Label>
                     <div className="flex items-center gap-2">
                       <Select
@@ -410,6 +417,7 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
                       </Button>
                     </div>
                   </div>
+                  {protection?.pairip && <PairipBanner />}
                 </div>
               )}
 
