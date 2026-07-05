@@ -1061,6 +1061,16 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
     if opts.make_debuggable {
         patched = upsert_application_attr(&patched, "android:debuggable", "true")?;
     }
+    // Force native libs to be extracted to the filesystem at install time. A modern
+    // APK ships its `.so` files uncompressed and page-aligned and sets
+    // `android:extractNativeLibs="false"` so Android mmaps them straight from the
+    // APK. apktool's rebuild re-compresses those entries, and `zipalign -p` can only
+    // page-align *stored* (uncompressed) entries — so the rebuilt libs end up
+    // compressed and the installer rejects the APK (INSTALL_FAILED_INVALID_APK:
+    // "Failed to extract native libraries, res=-2"). Setting this to "true" drops
+    // the uncompressed+aligned requirement entirely. Harmless no-op for APKs with no
+    // native libs, and also unblocks a Frida gadget injected into such an app.
+    patched = upsert_application_attr(&patched, "android:extractNativeLibs", "true")?;
     // apktool can decode a `<meta-data>` value it doesn't understand (some typed
     // values, `@null`, refs into a split) as a name-only element. aapt2 then
     // rebuilds it without a value, and Android's package parser rejects the APK
