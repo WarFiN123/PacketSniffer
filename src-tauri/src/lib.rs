@@ -311,28 +311,15 @@ async fn install_ca_certificate() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn open_in_postman(json: String) -> Result<(), String> {
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "postman_req_{}.json",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-    ));
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
-
-    // Convert path to absolute string, making sure it's valid for URI
-    let path_str = path.to_string_lossy().replace('\\', "/");
-    let uri = format!("postman://app/collections/import?path={}", path_str);
-
-    // Attempt to open the custom URL scheme
-    if let Err(_e) = open::that(&uri) {
-        // Fallback: try opening the file directly, the OS might map .json to code editor,
-        // but Postman might be the handler if we named it .postman_collection.json.
-        // Actually, let's rename it to have that extension just in case.
-    }
-
+async fn open_in_postman() -> Result<(), String> {
+    // Postman v12 has no supported deep link that ingests raw collection JSON:
+    // local file paths and arbitrary URLs are both rejected ("collection doesn't
+    // exist anymore"), and `import/link` only resolves *Postman-hosted* share
+    // links. The reliable, version-proof path is to place an equivalent cURL
+    // command on the clipboard (done in the frontend) and just bring Postman to
+    // the front so the user can paste it into a request URL bar, which Postman
+    // expands into a full request.
+    open::that("postman://app").map_err(|e| e.to_string())?;
     Ok(())
 }
 
