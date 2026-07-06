@@ -16,8 +16,12 @@
 // Toolchain (must be on PATH): java/keytool, apktool, zipalign, apksigner, adb.
 
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 // ─── Data shapes (serde camelCase — mirror these on the frontend) ─────────────
@@ -85,6 +89,15 @@ pub struct PatchOpts {
 pub struct PatchResult {
     pub output_path: String,
     pub warnings: Vec<String>,
+    /// True when the pipeline was skipped and a previously patched APK reused.
+    pub cached: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceInfo {
+    pub bytes: u64,
+    pub files: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +120,61 @@ pub fn check_apk_tools() -> Vec<String> {
         .filter(|bin| !tool_on_path(bin))
         .map(|bin| bin.to_string())
         .collect()
+}
+
+/// Size + file count of the APK working directory — the rebuildable scratch
+/// (decoded trees, pulled APKs, patched outputs, cache markers). Surfaced in
+/// Preferences so the user can see what "Clear workspace" would reclaim.
+#[tauri::command]
+pub fn apk_work_info() -> WorkspaceInfo {
+    let mut info = WorkspaceInfo { bytes: 0, files: 0 };
+    if let Ok(dir) = work_dir() {
+        dir_stats(&dir, &mut info.bytes, &mut info.files);
+    }
+    info
+}
+
+/// Delete everything inside the APK working directory. All of it is regenerable
+/// scratch (decoded trees, pulled APKs, patched outputs, cache markers), so this
+/// only frees disk and forces the next patch to rebuild from scratch — the
+/// persistent signing key and CA live in the parent data dir and are untouched.
+/// Returns what was reclaimed.
+#[tauri::command]
+pub async fn clear_apk_work() -> Result<WorkspaceInfo, String> {
+    tokio::task::spawn_blocking(|| {
+        let dir = work_dir()?;
+        let reclaimed = apk_work_info();
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| format!("read work dir: {e}"))?
+            .filter_map(|e| e.ok())
+        {
+            let p = entry.path();
+            let r = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+            if let Err(e) = r {
+                return Err(format!("remove {}: {e}", p.display()));
+            }
+        }
+        Ok(reclaimed)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+/// Request cancellation of the in-flight pull/patch: flip the cancel flag and
+/// kill any live child process immediately (`cancel_requested` is gated on an
+/// active pull/patch so a stale request can't abort unrelated adb calls).
+#[tauri::command]
+pub fn cancel_patch() {
+    CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+    if let Ok(children) = running_children().lock() {
+        for &pid in children.iter() {
+            kill_tree(pid);
+        }
+    }
 }
 
 /// Whether a tool resolves on PATH. Uses `where` (Windows) / `which` (unix) so
@@ -992,6 +1060,8 @@ fn device_has_pairip(serial: &str, package: &str) -> bool {
 }
 
 fn pull_base_apk(serial: &str, package: &str) -> Result<String, String> {
+    // Cancellable: pulling a large split set can take a while (see cancel_patch).
+    let _cancel = CancelScope::new();
     let out = run(
         Command::new("adb").args(["-s", serial, "shell", "pm", "path", package]),
         "pm path",
@@ -1056,6 +1126,9 @@ fn pull_base_apk(serial: &str, package: &str) -> Result<String, String> {
 // ─── Patch pipeline ───────────────────────────────────────────────────────────
 
 fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
+    // Scope cancellation to this run: clears any stale request on entry and again
+    // on exit (Drop), so a leftover flag can't abort a later adb/curl call.
+    let _cancel = CancelScope::new();
     let apk = validate_apk_path(&opts.apk_path)?;
     // Refuse PAIRIP apps up front — repackaging fundamentally can't work on them.
     if detect_pairip(&apk) {
@@ -1079,6 +1152,28 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
     let built = dir.join(format!("{stem}-built.apk"));
     let aligned = dir.join(format!("{stem}-aligned.apk"));
     let signed = dir.join(format!("{stem}-patched.apk"));
+
+    // 0. Cache -------------------------------------------------------------
+    // Reuse a previously patched APK when nothing that changes the output moved:
+    // the source bytes, the selected options, and the baked-in CA / Frida gadget
+    // are all folded into `cache_key`. Clearing the workspace (Preferences) or
+    // touching any input forces a fresh build.
+    let cache_marker = dir.join(format!("{stem}-patched.cache"));
+    let cache_key = patch_cache_key(&apk, &opts);
+    if signed.is_file()
+        && std::fs::read_to_string(&cache_marker).map(|s| s.trim() == cache_key).unwrap_or(false)
+    {
+        progress(app, "done", "Reused cached patch.");
+        return Ok(PatchResult {
+            output_path: signed.to_string_lossy().to_string(),
+            warnings: vec![
+                "Reused a previously patched APK from the workspace — the source and options were \
+                 unchanged. Clear the Android workspace in Preferences to force a fresh build."
+                    .to_string(),
+            ],
+            cached: true,
+        });
+    }
 
     // 1. Decode --------------------------------------------------------------
     progress(app, "decode", "Decompiling APK with apktool…");
@@ -1273,10 +1368,14 @@ fn run_patch(app: &AppHandle, opts: PatchOpts) -> Result<PatchResult, String> {
         "apksigner",
     )?;
 
+    // Record the cache key so an identical re-run skips the whole pipeline.
+    let _ = std::fs::write(&cache_marker, &cache_key);
+
     progress(app, "done", "Patch complete.");
     Ok(PatchResult {
         output_path: signed.to_string_lossy().to_string(),
         warnings,
+        cached: false,
     })
 }
 
@@ -2382,11 +2481,10 @@ fn no_window(cmd: &mut Command) -> &mut Command {
 
 /// Run a command, returning stdout on success or a stderr-derived error.
 /// All arguments are passed as an argv array (no shell), so device serials and
-/// package names cannot inject extra commands.
+/// package names cannot inject extra commands. Cancellable: if a pull/patch is
+/// aborted mid-flight the child is killed and `Err(CANCELLED)` is returned.
 fn run(cmd: &mut Command, ctx: &str) -> Result<String, String> {
-    let out = no_window(cmd)
-        .output()
-        .map_err(|e| format!("{ctx}: failed to launch ({e}) — is it installed and on PATH?"))?;
+    let out = spawn_wait(cmd, ctx)?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
@@ -2406,9 +2504,7 @@ fn run(cmd: &mut Command, ctx: &str) -> Result<String, String> {
 /// directory` when `-built.apk` was never written). Anchoring on the real artifact
 /// is wrapper-agnostic and surfaces apktool's own output for diagnosis.
 fn run_expect(cmd: &mut Command, ctx: &str, expected: &Path) -> Result<String, String> {
-    let out = no_window(cmd)
-        .output()
-        .map_err(|e| format!("{ctx}: failed to launch ({e}) — is it installed and on PATH?"))?;
+    let out = spawn_wait(cmd, ctx)?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     if expected.exists() {
@@ -2437,4 +2533,219 @@ fn run_expect(cmd: &mut Command, ctx: &str, expected: &Path) -> Result<String, S
     } else {
         Err(format!("{ctx} failed: {detail}"))
     }
+}
+
+// ─── Cancellation ─────────────────────────────────────────────────────────────
+// A single pull/patch runs at a time (the UI serializes them), so one process-
+// global cancel flag plus a registry of the live child PID is enough. `CancelScope`
+// marks a pull/patch active and clears the flag on entry and exit, so a stale
+// request can never abort an unrelated adb/curl call.
+
+static PATCH_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Error string every step returns on cancellation. The frontend matches on it to
+/// show a neutral "cancelled" state instead of a red error.
+const CANCELLED: &str = "Patch cancelled.";
+
+/// PIDs of children currently spawned by `spawn_wait`, so `cancel_patch` can kill
+/// them without waiting for the poll loop.
+fn running_children() -> &'static Mutex<Vec<u32>> {
+    static R: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// True only while a pull/patch is active AND cancellation was requested.
+fn cancel_requested() -> bool {
+    PATCH_ACTIVE.load(Ordering::SeqCst) && CANCEL_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// RAII marker for a cancellable operation: resets the flag on enter and exit.
+struct CancelScope;
+impl CancelScope {
+    fn new() -> Self {
+        CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+        PATCH_ACTIVE.store(true, Ordering::SeqCst);
+        CancelScope
+    }
+}
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        PATCH_ACTIVE.store(false, Ordering::SeqCst);
+        CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    }
+}
+
+fn register_child(pid: u32) {
+    if let Ok(mut v) = running_children().lock() {
+        v.push(pid);
+    }
+}
+fn unregister_child(pid: u32) {
+    if let Ok(mut v) = running_children().lock() {
+        v.retain(|&p| p != pid);
+    }
+}
+
+/// Kill a child and its descendants by PID. apktool/apksigner run a JVM under
+/// `cmd /C` on Windows, so killing just the cmd wrapper would orphan the JVM —
+/// `taskkill /T` takes the whole tree. Best-effort.
+fn kill_tree(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = no_window(Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]))
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
+}
+
+/// Spawn `cmd` and wait, polling the cancel flag every ~120 ms. stdout/stderr are
+/// drained on helper threads so a chatty tool can't deadlock on a full pipe. On
+/// cancel the process tree is killed and `Err(CANCELLED)` returned; otherwise the
+/// finished `Output` comes back exactly as `Command::output` would produce it.
+fn spawn_wait(cmd: &mut Command, ctx: &str) -> Result<std::process::Output, String> {
+    if cancel_requested() {
+        return Err(CANCELLED.to_string());
+    }
+    // Null stdin so a wrapper that reads it (apktool.bat ends with `pause`) gets an
+    // immediate EOF and never blocks — matching the old `Command::output` behavior.
+    no_window(cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("{ctx}: failed to launch ({e}) — is it installed and on PATH?"))?;
+    let pid = child.id();
+    register_child(pid);
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr_pipe {
+            let _ = s.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if cancel_requested() {
+                    kill_tree(pid);
+                    let _ = child.wait();
+                    unregister_child(pid);
+                    let _ = out_h.join();
+                    let _ = err_h.join();
+                    return Err(CANCELLED.to_string());
+                }
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            Err(e) => {
+                unregister_child(pid);
+                return Err(format!("{ctx}: wait failed ({e})"));
+            }
+        }
+    };
+    unregister_child(pid);
+    let stdout = out_h.join().unwrap_or_default();
+    let stderr = err_h.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+// ─── Workspace stats + patch cache key ────────────────────────────────────────
+
+/// Accumulate byte size + file count under `dir`, recursing into subdirectories.
+fn dir_stats(dir: &Path, bytes: &mut u64, files: &mut u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        match e.file_type() {
+            Ok(ft) if ft.is_dir() => dir_stats(&e.path(), bytes, files),
+            Ok(_) => {
+                if let Ok(m) = e.metadata() {
+                    *bytes += m.len();
+                    *files += 1;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Fingerprint every input that changes a patched APK's bytes: the source APK,
+/// the selected options, and the baked-in CA / Frida gadget / script files. An
+/// identical fingerprint means a re-run would produce the same output, so the
+/// cached `{stem}-patched.apk` can be reused instead of rebuilding.
+fn patch_cache_key(apk: &Path, opts: &PatchOpts) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Metadata fingerprint — fine for the small, stable auxiliary files (CA,
+    // gadget, script) that a re-pull never rewrites.
+    fn mix_file(h: &mut DefaultHasher, p: &Path) {
+        if let Ok(m) = std::fs::metadata(p) {
+            m.len().hash(h);
+            if let Ok(t) = m.modified() {
+                if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
+                    d.as_secs().hash(h);
+                    d.subsec_nanos().hash(h);
+                }
+            }
+        }
+    }
+
+    // Content fingerprint for the source APK. Device mode re-pulls the base every
+    // run (bumping its mtime) so metadata would never match — hash the bytes so an
+    // unchanged app version reuses the build. Streamed to avoid a big allocation.
+    fn mix_content(h: &mut DefaultHasher, p: &Path) {
+        if let Ok(mut f) = std::fs::File::open(p) {
+            let mut buf = [0u8; 65536];
+            loop {
+                match f.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => buf[..n].hash(h),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
+    let mut h = DefaultHasher::new();
+    mix_content(&mut h, apk);
+    opts.embed_proxy_ca.hash(&mut h);
+    opts.trust_user_store.hash(&mut h);
+    opts.make_debuggable.hash(&mut h);
+    opts.inject_frida.hash(&mut h);
+    if opts.embed_proxy_ca {
+        if let Ok(ca) = data_dir().map(|d| d.join("ca-cert.pem")) {
+            mix_file(&mut h, &ca);
+        }
+    }
+    if opts.inject_frida {
+        opts.frida_abi.hash(&mut h);
+        opts.frida_script_mode.hash(&mut h);
+        mix_file(&mut h, Path::new(&opts.frida_gadget_path));
+        if opts.frida_script_mode && !opts.frida_script_path.trim().is_empty() {
+            mix_file(&mut h, Path::new(&opts.frida_script_path));
+        }
+    }
+    format!("{:016x}", h.finish())
 }

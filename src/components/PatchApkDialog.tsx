@@ -31,6 +31,8 @@ import {
   RefreshCw,
   Copy,
   Search,
+  Ban,
+  History,
 } from "lucide-react";
 
 interface Props {
@@ -47,6 +49,7 @@ interface DevicePackage {
 interface PatchResult {
   outputPath: string;
   warnings: string[];
+  cached: boolean;
 }
 interface PatchProgress {
   stage: string;
@@ -235,6 +238,7 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
   // ── Run ────────────────────────────────────────────────────────────────
   const [run, setRun] = useState<RunState>("idle");
   const [activeStage, setActiveStage] = useState<string>("");
+  const [cancelling, setCancelling] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
   const [result, setResult] = useState<PatchResult | null>(null);
   const [installState, setInstallState] = useState<
@@ -274,6 +278,7 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
     setResult(null);
     setErrorMsg("");
     setActiveStage("");
+    setCancelling(false);
     setInstallState("idle");
     setInstallMsg("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -343,6 +348,7 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
     setRun("running");
     setResult(null);
     setErrorMsg("");
+    setCancelling(false);
     setActiveStage(source === "device" ? "pull" : "decode");
     setInstallState("idle");
 
@@ -368,11 +374,32 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
       setActiveStage("done");
       setRun("done");
     } catch (err) {
-      setErrorMsg(String(err));
-      setRun("error");
+      const msg = String(err);
+      // User-initiated cancel isn't a failure — reset to a clean idle state.
+      if (msg.includes("Patch cancelled")) {
+        setRun("idle");
+        setActiveStage("");
+        setResult(null);
+        setErrorMsg("");
+      } else {
+        setErrorMsg(msg);
+        setRun("error");
+      }
     } finally {
+      setCancelling(false);
       unlistenRef.current?.();
       unlistenRef.current = null;
+    }
+  };
+
+  // Ask the backend to kill the in-flight pull/patch. The awaited invoke above
+  // then rejects with the cancel sentinel, which the catch treats as a clean stop.
+  const cancelPatch = async () => {
+    setCancelling(true);
+    try {
+      await invoke("cancel_patch");
+    } catch {
+      /* best-effort */
     }
   };
 
@@ -651,6 +678,11 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
                 <span className="text-[11px] font-mono text-text-1 break-all flex-1">
                   {result.outputPath}
                 </span>
+                {result.cached && (
+                  <span className="flex items-center gap-1 shrink-0 rounded-full border border-border/70 bg-bg-1 px-2 py-0.5 text-[9px] font-mono uppercase tracking-wider text-muted-foreground">
+                    <History className="size-2.5" /> cached
+                  </span>
+                )}
                 <button
                   onClick={() =>
                     navigator.clipboard.writeText(result.outputPath)
@@ -680,9 +712,13 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
           <div className="flex items-center justify-between gap-3">
             <div className="text-[11px] text-muted-foreground">
               {run === "running"
-                ? "Patching… do not close"
+                ? cancelling
+                  ? "Stopping…"
+                  : "Patching… you can cancel"
                 : finished
-                  ? "Patch complete"
+                  ? result?.cached
+                    ? "Reused cached build"
+                    : "Patch complete"
                   : "Output is re-signed with a debug key"}
             </div>
             <div className="flex items-center gap-2">
@@ -711,9 +747,23 @@ export default function PatchApkDialog({ open, onOpenChange, device }: Props) {
                 <Button size="sm" onClick={() => onOpenChange(false)}>
                   Done
                 </Button>
+              ) : run === "running" ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={cancelPatch}
+                  disabled={cancelling}
+                >
+                  {cancelling ? (
+                    <Spinner size={14} className="mr-1.5" />
+                  ) : (
+                    <Ban className="size-3.5 mr-1.5" />
+                  )}
+                  {cancelling ? "Cancelling" : "Cancel"}
+                </Button>
               ) : (
                 <Button size="sm" onClick={startPatch} disabled={!canPatch}>
-                  {run === "running" ? <Spinner size={14} /> : "Patch"}
+                  Patch
                 </Button>
               )}
             </div>
