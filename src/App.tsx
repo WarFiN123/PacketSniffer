@@ -39,6 +39,22 @@ function isLocalAddr(addr?: string): boolean {
   return !addr || addr === "::1" || addr === "localhost" || addr.startsWith("127.");
 }
 
+/** Lowercased text the free-text filter searches. Sessions are immutable — the
+ *  backend sends a fresh object for every update — so a cached string stays
+ *  valid for that object's lifetime and is collected along with it. Without
+ *  this, typing a filter rebuilds one string per session per animation frame. */
+const haystacks = new WeakMap<HttpSession, string>();
+
+function searchHaystack(s: HttpSession): string {
+  let cached = haystacks.get(s);
+  if (cached === undefined) {
+    cached =
+      `${s.method} ${s.scheme} ${s.host} ${s.path} ${s.status} ${s.contentType} ${s.url}`.toLowerCase();
+    haystacks.set(s, cached);
+  }
+  return cached;
+}
+
 function matchesContentFilter(s: HttpSession, filter: ContentFilter): boolean {
   if (filter === "All") return true;
 
@@ -239,25 +255,43 @@ export default function App() {
       .catch(() => {});
   }, []);
 
-  // Check for missing system dependencies
+  // Startup checks run in sequence, never side by side. Missing packages come
+  // first because on Linux the CA install needs `certutil` (libnss3-tools) to
+  // reach Firefox's own certificate store — and opening both dialogs at once
+  // stacks two focus traps on top of each other.
   useEffect(() => {
-    invoke<string[]>("check_missing_deps")
-      .then((deps) => {
-        if (deps.length > 0) {
-          setMissingDeps(deps);
-          setShowDepDialog(true);
-        }
-      })
-      .catch(() => {});
+    let cancelled = false;
+
+    (async () => {
+      const deps = await invoke<string[]>("check_missing_deps").catch(
+        () => [] as string[],
+      );
+      if (cancelled) return;
+
+      if (deps.length > 0) {
+        setMissingDeps(deps);
+        setShowDepDialog(true);
+        return; // The CA prompt follows once this dialog is dismissed.
+      }
+
+      // On failure assume trusted: a broken check shouldn't nag on every launch.
+      const trusted = await invoke<boolean>("check_ca_trusted").catch(() => true);
+      if (!cancelled && !trusted) setShowCaDialog(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Check if CA certificate is trusted — show in-app dialog instead of system one
-  useEffect(() => {
+  const handleDepDialogChange = useCallback((open: boolean) => {
+    setShowDepDialog(open);
+    if (open) return;
+    // Re-check now that certutil may exist — the CA install can only reach
+    // Firefox's NSS database once it does.
     invoke<boolean>("check_ca_trusted")
-      .then((isTrusted) => {
-        if (!isTrusted) {
-          setShowCaDialog(true);
-        }
+      .then((trusted) => {
+        if (!trusted) setShowCaDialog(true);
       })
       .catch(() => {});
   }, []);
@@ -334,11 +368,7 @@ export default function App() {
         if (!statusClasses.has(cls)) return false;
       }
 
-      if (needle) {
-        const haystack =
-          `${s.method} ${s.scheme} ${s.host} ${s.path} ${s.status} ${s.contentType} ${s.url}`.toLowerCase();
-        if (!haystack.includes(needle)) return false;
-      }
+      if (needle && !searchHaystack(s).includes(needle)) return false;
 
       return true;
     });
@@ -388,21 +418,44 @@ export default function App() {
     return () => ro.disconnect();
   }, []);
 
-  const sidebarMaxSize = useMemo(() => {
-    let longest = 0;
-    for (const id of order) {
-      const s = sessions.get(id);
-      if (s && s.host.length > longest) longest = s.host.length;
+  // Longest host name seen, which drives the sidebar's max width. Rescanning
+  // every session on each frame is pure waste under load, so only ids newer
+  // than the last scan are measured — `order` is append-ordered by id, so
+  // walking back from the tail until a known id stops exactly at the new ones.
+  // The value only grows: evicting the longest host doesn't shrink the cap,
+  // which is fine for a max-width bound and keeps the sidebar from jumping.
+  const [longestHost, setLongestHost] = useState(0);
+  const lastMeasuredId = useRef(-1);
+
+  useEffect(() => {
+    if (order.length === 0) {
+      lastMeasuredId.current = -1;
+      setLongestHost(0);
+      return;
     }
+
+    let longest = 0;
+    for (let i = order.length - 1; i >= 0; i--) {
+      const id = order[i];
+      if (id <= lastMeasuredId.current) break;
+      const host = sessions.get(id)?.host;
+      if (host && host.length > longest) longest = host.length;
+    }
+
+    lastMeasuredId.current = order[order.length - 1];
+    setLongestHost((prev) => Math.max(prev, longest));
+  }, [order, sessions]);
+
+  const sidebarMaxSize = useMemo(() => {
     // Sidebar horizontal overhead: tree indent(20) + row px(8+8) + gap(6) + icon(14) + container pr(8) + scrollbar(12) aprox 76px
     // Monospace 11px char width approx 6.6px
-    const neededPx = 76 + longest * 6.6;
+    const neededPx = 76 + longestHost * 6.6;
     const width =
       containerWidth || panelGroupRef.current?.offsetWidth || window.innerWidth;
     const pct = Math.ceil((neededPx / width) * 100);
     // force it between 15-50% (note to self: this takes pixels)
     return `${Math.max(15, Math.min(50, pct))}%`;
-  }, [sessions, order, containerWidth]);
+  }, [longestHost, containerWidth]);
 
   const selectedSession =
     selectedId !== null ? (sessions.get(selectedId) ?? null) : null;
@@ -576,7 +629,7 @@ export default function App() {
 
         <DependencyDialog
           open={showDepDialog}
-          onOpenChange={setShowDepDialog}
+          onOpenChange={handleDepDialogChange}
           missingDeps={missingDeps}
         />
       </div>

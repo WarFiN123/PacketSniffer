@@ -107,7 +107,9 @@ export default function StatusBar({
           <>
             {isFiltered ? `${filteredCount}/${totalCount}` : `${totalCount}`}{" "}
             {totalCount === 1 ? "row" : "rows"}
-            {selectedId !== null && ` (${selectedId} selected)`}
+            {/* `selectedId` is a request id, not a count — label it as one so
+                "#4213" doesn't read as "4213 rows selected". */}
+            {selectedId !== null && ` (#${selectedId} selected)`}
           </>
         ) : (
           "No requests"

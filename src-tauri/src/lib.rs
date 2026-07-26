@@ -304,9 +304,18 @@ async fn set_proxy_port(
 }
 
 #[tauri::command]
-async fn install_ca_certificate() -> Result<String, String> {
+async fn install_ca_certificate() -> Result<cert_store::CaInstallResult, String> {
     cert_store::ensure_ca_trusted()
         .await
+        .map_err(|e| e.to_string())
+}
+
+/// Absolute path of the root CA PEM, so the UI can offer a manual install when
+/// the automated one is refused or unavailable.
+#[tauri::command]
+fn get_ca_cert_path() -> Result<String, String> {
+    proxy::ca::CertificateAuthority::initialize(None)
+        .map(|ca| ca.ca_cert_path().to_string_lossy().to_string())
         .map_err(|e| e.to_string())
 }
 
@@ -409,6 +418,7 @@ pub fn run() {
             fix_proxy,
             set_proxy_port,
             install_ca_certificate,
+            get_ca_cert_path,
             check_ca_trusted,
             check_missing_deps,
             install_dependency,

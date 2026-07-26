@@ -165,9 +165,13 @@ impl CertificateAuthority {
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::NoCa;
         params.distinguished_name.push(DnType::CommonName, hostname);
-        params
-            .subject_alt_names
-            .push(SanType::DnsName(hostname.try_into()?));
+        // A literal IP must go in an iPAddress SAN. Browsers reject a dNSName
+        // that holds an address, so a CONNECT to https://192.168.1.5 would fail
+        // with SSL_ERROR_BAD_CERT_DOMAIN even though the CA itself is trusted.
+        params.subject_alt_names.push(match hostname.parse() {
+            Ok(ip) => SanType::IpAddress(ip),
+            Err(_) => SanType::DnsName(hostname.try_into()?),
+        });
         params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
         ];
@@ -198,17 +202,15 @@ impl CertificateAuthority {
         // Advertise HTTP/2 + HTTP/1.1 via ALPN so browsers can negotiate h2
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-        let config = Arc::new(config);
-
-        // Insert into cache
-        {
-            let mut cache = self.ctx_cache.lock().unwrap();
+        // Insert into cache. Two connections to the same host can race here;
+        // return whichever config won so every connection to a host is served
+        // the same leaf rather than a per-race duplicate.
+        let mut cache = self.ctx_cache.lock().unwrap();
+        Ok(Arc::clone(
             cache
                 .entry(hostname.to_string())
-                .or_insert_with(|| Arc::clone(&config));
-        }
-
-        Ok(config)
+                .or_insert_with(|| Arc::new(config)),
+        ))
     }
 
     /// Path to the CA certificate PEM file.

@@ -53,7 +53,7 @@ Bounded at `MAX_SESSIONS = 5000` (defined in `lib.rs` and mirrored in `useTauriE
 | `src-tauri/src/proxy/ca.rs` | Root CA + per-host cert generation (cached by hostname) |
 | `src-tauri/src/proxy/intercept.rs` | Process-global intercept rules (RwLock) |
 | `src-tauri/src/system_proxy.rs` | OS proxy registry (Windows/macOS/Linux) |
-| `src-tauri/src/cert_store.rs` | OS trust store check + CA install |
+| `src-tauri/src/cert_store.rs` | OS trust store check + CA install. On Linux also writes each browser's NSS DB — see "Browser trust on Linux" |
 | `src-tauri/src/apk.rs` | Android MITM: repatches APKs (apktool) to trust the proxy CA via injected `network_security_config.xml`, re-signs (zipalign/apksigner); requires java/keytool/apktool/zipalign/apksigner/adb on PATH |
 | `src/App.tsx` | Root layout, top-level state |
 | `src/hooks/useTauriEvents.ts` | Event batching, session map, WS message map |
@@ -68,5 +68,17 @@ All session state lives in `App.tsx` via `useProxySessions()` and `useWsMessages
 - `MAX_SESSIONS` constant must be identical in `lib.rs` and `useTauriEvents.ts`.
 - `InterceptConfig` field names must match between `intercept.rs` (serde rename `camelCase`) and `src/lib/intercept.ts`.
 - Bodies are never in the streamed event — always fetch via `get_session()`.
-- CA cert lives at `{app_data}/ca.crt` / `ca.key`; per-host certs cached in `ServerConfig` map inside `ca.rs`.
+- CA cert lives at `{app_data}/ca-cert.pem` / `ca-key.pem`, gated by a `ca-version` file (`CA_VERSION` in `ca.rs` — bump it to force regeneration). Per-host certs are in-memory only, cached in a `ServerConfig` map inside `ca.rs`.
 - System proxy is restored on `stop_proxy()` and also on startup (stale cleanup for crash recovery).
+
+### Browser trust on Linux
+
+`security.enterprise_roots.enabled` is implemented only for Windows and macOS. A CA in `/etc/ssl` is therefore **invisible to Firefox and Chromium on Linux** — every HTTPS page fails with `MOZILLA_PKIX_ERROR_MITM_DETECTED` (Firefox's rename of `SEC_ERROR_UNKNOWN_ISSUER`, triggered when its MITM canary probe returns a cert from the same unknown root). Writing `security.enterprise_roots.enabled` into a profile's `user.js` does nothing there.
+
+So `ensure_trusted_linux` does three things, and dropping any one of them reintroduces the bug:
+
+1. **System anchor** — distro-detected (`trust_store()`: Debian / Fedora / openSUSE / Arch each use a different anchor dir and refresh command). Serves curl, git, python; not browsers.
+2. **NSS databases** — `certutil -A -t CT,,` into every profile found via `profiles.ini` across native, Snap and Flatpak installs, plus `~/.pki/nssdb` for the Chromium family. This is what actually fixes the browsers, and it needs `certutil` from libnss3-tools.
+3. **`policies.json`** — merged, never overwritten, so distro/enterprise policies survive. Covers profiles created later.
+
+Steps 1 and 3 need root and share **one** `pkexec` call — keep it that way; splitting it means a password prompt per file. Never write to `/snap/firefox/...` (read-only squashfs); the Snap reads `/etc/firefox/policies` instead.
