@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 
 export type ContentFilter =
@@ -83,8 +84,61 @@ export default function ContentFilterBar({
   statusClasses,
   onToggleStatus,
 }: ContentFilterBarProps) {
+  // The pills can't shrink without becoming unreadable, so a narrow window
+  // scrolls them. The scrollbar is hidden to keep the 28px bar clean, which
+  // leaves no hint that anything is off-screen — hence the edge fades, plus
+  // wheel support so a trackpad or mouse can reach the hidden filters.
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const [overflow, setOverflow] = useState({ start: false, end: false });
+
+  const syncOverflow = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const max = el.scrollWidth - el.clientWidth;
+    setOverflow({
+      start: el.scrollLeft > 1,
+      end: el.scrollLeft < max - 1,
+    });
+  }, []);
+
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    syncOverflow();
+    const ro = new ResizeObserver(syncOverflow);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [syncOverflow]);
+
+  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
+    const el = scrollerRef.current;
+    // A vertical wheel over a horizontal-only strip would otherwise do nothing.
+    if (!el || e.deltaY === 0 || e.deltaX !== 0) return;
+    el.scrollLeft += e.deltaY;
+  }, []);
+
   return (
-    <div className="flex items-center h-7 px-2 gap-0.5 bg-background border-b border-border shrink-0 overflow-x-auto scrollbar-hide">
+    <div className="relative shrink-0 bg-background border-b border-border">
+      <div
+        aria-hidden
+        className={cn(
+          "pointer-events-none absolute inset-y-0 left-0 z-10 w-6 bg-gradient-to-r from-background to-transparent transition-opacity",
+          overflow.start ? "opacity-100" : "opacity-0",
+        )}
+      />
+      <div
+        aria-hidden
+        className={cn(
+          "pointer-events-none absolute inset-y-0 right-0 z-10 w-6 bg-gradient-to-l from-background to-transparent transition-opacity",
+          overflow.end ? "opacity-100" : "opacity-0",
+        )}
+      />
+      <div
+        ref={scrollerRef}
+        onScroll={syncOverflow}
+        onWheel={handleWheel}
+        className="flex items-center h-7 px-2 gap-0.5 overflow-x-auto scrollbar-hide"
+      >
       {/* Protocol */}
       {PROTOCOL.map((f) => (
         <Pill
@@ -137,6 +191,7 @@ export default function ContentFilterBar({
           </button>
         );
       })}
+      </div>
     </div>
   );
 }

@@ -1,4 +1,11 @@
-import { useRef, useEffect, useState, useCallback, memo } from "react";
+import {
+  useRef,
+  useEffect,
+  useState,
+  useCallback,
+  useMemo,
+  memo,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { cn } from "@/lib/utils";
@@ -84,6 +91,57 @@ const RESIZABLE = new Set<ColId>([
 ]);
 const COL_SPAN = COL_IDS.length + 1; // + filler
 const WIDTHS_KEY = "ps_col_widths";
+
+type Widths = Record<ColId, number>;
+
+function minWidth(id: ColId): number {
+  return MIN_WIDTHS[id] ?? 40;
+}
+
+/**
+ * Fit the stored column widths into `available` pixels.
+ *
+ * Stored widths are treated as a *ratio*, not as absolute sizes: when the pane
+ * is narrower than their sum, resizable columns shrink proportionally rather
+ * than pushing a horizontal scrollbar onto the user. Fixed columns (the status
+ * dot and pin) never shrink, and no column goes below its minimum — once every
+ * column has bottomed out, the scrollbar is genuinely the only option left.
+ */
+function fitColumns(base: Widths, available: number): Widths {
+  const fitted = { ...base };
+  const fixed = COL_IDS.filter((id) => !RESIZABLE.has(id)).reduce(
+    (sum, id) => sum + base[id],
+    0,
+  );
+
+  let pool = COL_IDS.filter((id) => RESIZABLE.has(id));
+  let poolWidth = pool.reduce((sum, id) => sum + base[id], 0);
+  let budget = available - fixed;
+
+  if (budget <= 0 || poolWidth <= 0 || budget >= poolWidth) return fitted;
+
+  // Shrink proportionally, park any column that would breach its minimum, and
+  // redistribute that column's shortfall across the ones with slack left. Each
+  // pass parks at least one column, so this terminates in at most `pool` passes.
+  while (pool.length > 0) {
+    const scale = budget / poolWidth;
+    const parked = pool.filter((id) => base[id] * scale < minWidth(id));
+
+    if (parked.length === 0) {
+      for (const id of pool) fitted[id] = Math.floor(base[id] * scale);
+      break;
+    }
+
+    for (const id of parked) {
+      fitted[id] = minWidth(id);
+      budget -= fitted[id];
+      poolWidth -= base[id];
+    }
+    pool = pool.filter((id) => !parked.includes(id));
+  }
+
+  return fitted;
+}
 
 function ResizeHandle({
   onMouseDown,
@@ -276,15 +334,29 @@ export default function RequestTable({
   const containerRef = useRef<HTMLDivElement>(null);
   const isAtBottomRef = useRef(true);
 
-  // Resizable column widths (persisted to localStorage).
-  const [widths, setWidths] = useState<Record<string, number>>(() => {
+  // Base column widths (persisted to localStorage). These define the ratio the
+  // layout keeps; `fitted` below is what actually gets rendered.
+  const [widths, setWidths] = useState<Widths>(() => {
+    let stored: Partial<Widths> = {};
     try {
       const saved = localStorage.getItem(WIDTHS_KEY);
-      if (saved) return { ...DEFAULT_WIDTHS, ...JSON.parse(saved) };
+      if (saved) stored = JSON.parse(saved);
     } catch {
       // ignore
     }
-    return { ...DEFAULT_WIDTHS };
+    // Clamp on the way in: a stale or hand-edited entry (or one written by an
+    // older build with different columns) must never yield a zero or NaN width,
+    // which would poison the proportional fit below.
+    const widths = { ...DEFAULT_WIDTHS };
+    for (const id of COL_IDS) {
+      // Fixed columns aren't user-adjustable, so they always take the default.
+      if (!RESIZABLE.has(id)) continue;
+      const value = stored[id];
+      if (typeof value === "number" && Number.isFinite(value)) {
+        widths[id] = Math.max(minWidth(id), value);
+      }
+    }
+    return widths;
   });
   const widthsRef = useRef(widths);
   widthsRef.current = widths;
@@ -297,16 +369,39 @@ export default function RequestTable({
     }
   }, [widths]);
 
+  // Available width drives the fit, so it has to be re-measured on every pane
+  // or window resize — not just on mount.
+  const [viewport, setViewport] = useState(0);
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => {
+      setViewport(entry.contentRect.width);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const fitted = useMemo(
+    () => (viewport > 0 ? fitColumns(widths, viewport) : widths),
+    [widths, viewport],
+  );
+  const fittedRef = useRef(fitted);
+  fittedRef.current = fitted;
+
   const startResize = useCallback((e: React.MouseEvent, colId: ColId) => {
     e.preventDefault();
     e.stopPropagation();
     const startX = e.clientX;
     const startW = widthsRef.current[colId] ?? DEFAULT_WIDTHS[colId];
-    const min = MIN_WIDTHS[colId] ?? 40;
+    const min = minWidth(colId);
+    // While the layout is scaled down, a 1px drag moves the edge by less than
+    // 1px. Divide the delta by that scale so the column edge tracks the cursor.
+    const scale = startW > 0 ? (fittedRef.current[colId] ?? startW) / startW : 1;
 
     const onMove = (ev: MouseEvent) => {
-      const next = Math.max(min, startW + (ev.clientX - startX));
-      setWidths((w) => ({ ...w, [colId]: next }));
+      const delta = (ev.clientX - startX) / (scale || 1);
+      setWidths((w) => ({ ...w, [colId]: Math.max(min, startW + delta) }));
     };
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
@@ -320,10 +415,8 @@ export default function RequestTable({
     document.body.style.userSelect = "none";
   }, []);
 
-  const totalWidth = COL_IDS.reduce(
-    (sum, id) => sum + (widths[id] ?? DEFAULT_WIDTHS[id]),
-    0,
-  );
+  // Only forces a scrollbar once every column has bottomed out at its minimum.
+  const totalWidth = COL_IDS.reduce((sum, id) => sum + fitted[id], 0);
 
   const virtualizer = useVirtualizer({
     count: order.length,
@@ -389,10 +482,7 @@ export default function RequestTable({
         >
           <colgroup>
             {COL_IDS.map((id) => (
-              <col
-                key={id}
-                style={{ width: widths[id] ?? DEFAULT_WIDTHS[id] }}
-              />
+              <col key={id} style={{ width: fitted[id] }} />
             ))}
             <col />
           </colgroup>

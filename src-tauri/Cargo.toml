@@ -2,7 +2,7 @@
 name = "packetsniffer"
 version = "0.4.0"
 edition = "2021"
-description = "MITM-proxy with HTTP(s) interception and SSL decryption."
+description = "Inspect and rewrite HTTP, HTTPS and WebSocket traffic"
 
 [lib]
 name = "packetsniffer_lib"
