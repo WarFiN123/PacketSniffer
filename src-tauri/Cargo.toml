@@ -42,7 +42,7 @@ tokio-stream = "0.1"
 # Keep httparse for low-level parsing where needed
 httparse = "1"
 tauri-plugin-updater = "2.10.0"
-base64 = "0.22.1"
+base64 = "0.23.1"
 hex = "0.4.3"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-dialog = "2.6.0"
